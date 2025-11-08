@@ -1,4 +1,4 @@
-# user_data.py
+# User_Data.py
 import time
 from pathlib import Path
 import pandas as pd
@@ -20,7 +20,6 @@ def _retry_io(func, *args, **kwargs):
     raise last
 
 def _write_df(df: pd.DataFrame):
-    # enforce schema and types
     df = df.copy()
     df["UserID"] = df["UserID"].astype(str)
     df["Username"] = df["Username"].astype(str)
@@ -32,17 +31,15 @@ def load_or_create_excel():
         df = pd.DataFrame(columns=["UserID", "Username", "Money"])
         _write_df(df)
     else:
-        # migrate: coerce existing to correct dtypes (fixes rounded floats)
         df = _retry_io(pd.read_excel, EXCEL_PATH, dtype={"UserID": str, "Username": str, "Money": "Int64"})
         if "UserID" not in df.columns:
             df = pd.DataFrame(columns=["UserID", "Username", "Money"])
         else:
             df["UserID"] = df["UserID"].astype(str)
             if "Money" in df.columns:
-                # convert NA to 0 then int
-                df["Money"] = df["Money"].fillna(0).astype(int)
+                df["Money"] = df["Money"].fillna(START_MONEY).astype(int)
             else:
-                df["Money"] = 0
+                df["Money"] = START_MONEY
             if "Username" not in df.columns:
                 df["Username"] = ""
         _write_df(df)
