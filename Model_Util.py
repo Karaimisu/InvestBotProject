@@ -1,4 +1,4 @@
-# model_util.py
+# Model_Util.py
 from openai import OpenAI
 
 def resolve_model(client: OpenAI, env_model: str | None):
@@ -15,4 +15,4 @@ def resolve_model(client: OpenAI, env_model: str | None):
             return ids[0]
     except Exception:
         pass
-    return "typhoon-v2.1-12b-instruct"
+    return "typhoon-v1"

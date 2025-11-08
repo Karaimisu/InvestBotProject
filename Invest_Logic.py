@@ -23,13 +23,8 @@ def stars(n: int) -> str:
     return "★" * n + "☆" * (DIFFICULTY_MAX - n)
 
 def balanced_difficulty(money: int) -> int:
-    """
-    Tuned so 'hard' occurs less often.
-    Base by bankroll; random tilt biased toward same/softer difficulty.
-    """
     base = 1 if money < 5_000 else 2 if money < 15_000 else 3 if money < 30_000 else 4
     r = random.random()
-    # 60% stay at base, 25% easier (-1), 12% +1, 3% +2
     if r < 0.25: delta = -1
     elif r < 0.85: delta = 0
     elif r < 0.97: delta = +1
@@ -37,16 +32,11 @@ def balanced_difficulty(money: int) -> int:
     return max(1, min(DIFFICULTY_MAX, base + delta))
 
 def pick_correct_action(tone: str, difficulty: int) -> str:
-    """
-    Fix one 'correct' action for this scenario.
-    Low difficulty aligns with tone; higher difficulty allows contrarian outcomes.
-    """
-    contrarian_p = 0.05 * difficulty  # 5%..25%
+    contrarian_p = 0.05 * difficulty
     if tone == "bullish":
         return random.choices(["Buy", "Hold", "Sell"], weights=[1-contrarian_p, contrarian_p*0.6, contrarian_p*0.4])[0]
     if tone == "bearish":
         return random.choices(["Sell", "Hold", "Buy"], weights=[1-contrarian_p, contrarian_p*0.6, contrarian_p*0.4])[0]
-    # mixed
     return random.choices(["Hold", "Buy", "Sell"], weights=[0.7, 0.15, 0.15])[0]
 
 def _safe_parse_json(txt: str) -> dict:
@@ -86,11 +76,8 @@ def generate_scenario(ai_client: OpenAI, company_name: str, sector: str, money: 
     )
 
 def generate_news(ai_client: OpenAI, scenario: Scenario, model_id: Optional[str] = None):
-    """
-    Decision-oriented news: include Pros/Cons/Signals to help choose.
-    """
     hint = 1 if scenario.difficulty <= 2 else 2 if scenario.difficulty == 3 else 3
-    n_items = 4  # keep tight and useful
+    n_items = 4
     sys = (
         "คุณจะสร้างข่าวสั้นเพื่อช่วยผู้เล่นตัดสินใจในสถานการณ์หุ้น "
         "ตอบเป็น JSON: {"
@@ -114,7 +101,6 @@ def generate_news(ai_client: OpenAI, scenario: Scenario, model_id: Optional[str]
     data = _safe_parse_json(resp.choices[0].message.content)
     items = (data.get("news") or [])[:n_items]
     brief = data.get("decision_brief") or {}
-    # sanitize brief
     brief.setdefault("pros", [])
     brief.setdefault("cons", [])
     brief.setdefault("signals", [])
@@ -122,9 +108,6 @@ def generate_news(ai_client: OpenAI, scenario: Scenario, model_id: Optional[str]
     return {"items": items, "brief": brief}
 
 def _max_pct_by_bankroll(bankroll: int) -> float:
-    """
-    Max position size as % of bankroll, grows with bankroll.
-    """
     b = abs(bankroll)
     if b < 5_000: return 0.08
     if b < 20_000: return 0.12
@@ -132,47 +115,29 @@ def _max_pct_by_bankroll(bankroll: int) -> float:
     return 0.25
 
 def _difficulty_vol_multiplier(difficulty: int) -> float:
-    # impacts volatility and payout range
     return 1.0 + 0.15 * (difficulty - 1)   # 1.0 .. 1.6
 
 def _floor_min_by_difficulty(difficulty: int) -> int:
-    # min absolute dollar swing (100..500)
     return min(500, 100 + (difficulty - 1) * 100)
 
 def compute_trade_size(request_amount: Optional[int], bankroll: int, difficulty: int) -> int:
-    """
-    Applies floors/caps. If bankroll < 0, cap to amount needed to return to >= 0.
-    """
-    # hard floor 100
     floor_abs = 100
-    # soft cap by bankroll
     cap_pct = _max_pct_by_bankroll(bankroll)
     cap_abs = int(max(200, abs(bankroll) * cap_pct))
-    # negative-balance rule: cannot invest more than needed to get back to >= 0
     if bankroll < 0:
         cap_abs = min(cap_abs, abs(bankroll))
-    # if user provided, clamp it
     if request_amount and request_amount > 0:
         size = max(floor_abs, min(request_amount, cap_abs))
     else:
-        # default: 10% of bankroll, clamped
         size = int(abs(bankroll) * 0.10)
         size = max(floor_abs, min(size, cap_abs))
     return size
 
 def simulate_outcome(choice: str, scenario: Scenario, bankroll: int, requested_amount: Optional[int] = None):
-    """
-    One fixed correct answer. P&L scales with difficulty and bankroll.
-    """
     size = compute_trade_size(requested_amount, bankroll, scenario.difficulty)
-
-    # base drift from scenario tone
     base_mu = {"bullish": 0.010, "bearish": -0.010, "mixed": 0.0}[scenario.tone]
-    vol_mult = _difficulty_vol_multiplier(scenario.difficulty)
-    sigma = 0.02 * vol_mult  # 2% .. 3.2%
+    sigma = 0.02 * _difficulty_vol_multiplier(scenario.difficulty)
 
-    # outcome shaping by correctness
-    # correct: tilt in your favor; wrong: tilt against you; hold: small variance around zero
     if choice == scenario.correct_action:
         drift = random.gauss(base_mu * 1.5, sigma)
     elif choice == "Hold":
@@ -181,15 +146,9 @@ def simulate_outcome(choice: str, scenario: Scenario, bankroll: int, requested_a
         drift = random.gauss(-base_mu * 1.2, sigma)
 
     raw_pnl = int(size * drift)
-
-    # ensure min absolute swing based on difficulty
     min_abs = _floor_min_by_difficulty(scenario.difficulty)
-    if raw_pnl >= 0:
-        pnl = max(raw_pnl, min_abs)
-    else:
-        pnl = min(raw_pnl, -min_abs)
-
-    new_bankroll = bankroll + pnl  # allow negatives
+    pnl = max(raw_pnl, min_abs) if raw_pnl >= 0 else min(raw_pnl, -min_abs)
+    new_bankroll = bankroll + pnl
 
     feedback_seed = {
         "Buy": "คุณตัดสินใจเข้าซื้อ",
@@ -199,3 +158,26 @@ def simulate_outcome(choice: str, scenario: Scenario, bankroll: int, requested_a
     }[choice]
 
     return new_bankroll, pnl, size, feedback_seed
+
+def generate_tip_and_reason(ai_client: OpenAI, scenario: Scenario, choice: str, pnl: int, size: int, trend: str, model_id: Optional[str] = None) -> str:
+    """
+    Produce a short tip and a causal reason why the chart moved (rise/fall/sideways).
+    trend: 'uptrend' | 'downtrend' | 'sideways'
+    """
+    direction = "กำไร" if pnl >= 0 else "ขาดทุน"
+    move = {"uptrend": "ราคาปรับขึ้น", "downtrend": "ราคาปรับลง", "sideways": "ราคาแกว่งตัว"}[trend]
+    sys = "คุณเป็นติวเตอร์การเทรดในเกม ให้คำแนะนำสั้น กระชับ ไม่ใช่คำแนะนำส่วนบุคคล"
+    user = (
+        f"สถานการณ์: tone={scenario.tone}, diff={scenario.difficulty}, sector={scenario.sector}. "
+        f"ผู้เล่นเลือก: {choice}. ผลลัพธ์: {direction} {abs(pnl)} ดอลลาร์ จากขนาด {size} ดอลลาร์. "
+        f"แนวโน้มกราฟล่าสุด: {trend} ({move}). "
+        "จงตอบ 2-3 ประโยค: "
+        "1) Tip: คำแนะนำฝึกทักษะ เช่น วิธีอ่านสัญญาณ/จัดการความเสี่ยง "
+        "2) Reason: เหตุผลเชิงเรื่องราวว่าเพราะอะไรกราฟจึงขึ้น/ลง/แกว่ง สอดคล้องกับอุตสาหกรรมและโทน"
+    )
+    resp = ai_client.chat.completions.create(
+        model=model_id or "typhoon-v1",
+        messages=[{"role":"system","content":sys},{"role":"user","content":user}],
+        temperature=0.6
+    )
+    return resp.choices[0].message.content.strip()

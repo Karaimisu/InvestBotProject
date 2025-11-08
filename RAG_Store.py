@@ -24,7 +24,7 @@ META_PATH = RAG_DIR / "meta.json"
 STORE_PATH = RAG_DIR / "store.jsonl"
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-EMB_DIM = 384  # for MiniLM-L6
+EMB_DIM = 384
 
 @dataclass
 class Chunk:
@@ -58,7 +58,6 @@ def _clean_text(t: str) -> str:
     return t.strip()
 
 def _chunk(text: str, max_tokens: int = 700, overlap: int = 100) -> List[str]:
-    # token-light: approximate tokens by characters (~4 chars per token)
     max_len = max_tokens * 4
     ov = overlap * 4
     text = _clean_text(text)
@@ -68,7 +67,6 @@ def _chunk(text: str, max_tokens: int = 700, overlap: int = 100) -> List[str]:
     i = 0
     while i < len(text):
         j = min(len(text), i + max_len)
-        # try to cut at paragraph boundary
         cut = text[i:j]
         last_break = cut.rfind("\n\n")
         if last_break > ov:
@@ -102,7 +100,6 @@ def rebuild_index() -> Tuple[int, int]:
             ))
 
     if not docs:
-        # create an empty index placeholder
         index = faiss.IndexFlatIP(EMB_DIM)
         faiss.write_index(index, str(INDEX_PATH))
         META_PATH.write_text(json.dumps({"emb_model": MODEL_NAME, "count": 0}, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -124,7 +121,7 @@ def rebuild_index() -> Tuple[int, int]:
 
     return len(files), len(docs)
 
-def _load_store() -> Tuple[faiss.Index, List[Chunk]]:
+def _load_store():
     if not INDEX_PATH.exists():
         rebuild_index()
     index = faiss.read_index(str(INDEX_PATH))
@@ -132,7 +129,7 @@ def _load_store() -> Tuple[faiss.Index, List[Chunk]]:
     if STORE_PATH.exists():
         with open(STORE_PATH, "r", encoding="utf-8") as f:
             for line in f:
-                if not line.strip(): 
+                if not line.strip():
                     continue
                 obj = json.loads(line)
                 chunks.append(Chunk(**obj))

@@ -10,9 +10,8 @@ def _safe_json(txt: str) -> dict:
 
 def generate_daily_news(ai_client, model_id: str, company: Optional[Dict[str, Any]] = None) -> List[dict]:
     """
-    Returns a list of items: [{category, headline, blurb}]
-    If company is provided: {"name": "...", "sector": "..."}
-    Prompts in Thai. Keys stay English for stable parsing.
+    Returns: [{category, headline, blurb}]
+    Thai prompts. Keys in English for stable parsing.
     """
     company_clause = ""
     if company and company.get("name"):
@@ -24,7 +23,7 @@ def generate_daily_news(ai_client, model_id: str, company: Optional[Dict[str, An
     system = (
         "คุณคือบรรณาธิการหนังสือพิมพ์รายวันในโลกสมมติ "
         "ให้ผลลัพธ์เป็น JSON เท่านั้น: {\"news\": [{\"category\": str, \"headline\": str, \"blurb\": str}, ...]} "
-        "หลีกเลี่ยงการใส่ลิงก์ ตัวเลขที่เฉพาะเจาะจงมากเกินไป และชื่อบุคคลจริง"
+        "หลีกเลี่ยงการใส่ลิงก์ ตัวเลขที่ละเอียด และชื่อบุคคลจริง"
     )
     user = (
         "สร้างเนื้อหาข่าววันนี้ 6-8 เรื่อง ครอบคลุมหมวด: โลก, ธุรกิจ, เทคโนโลยี, วิทยาศาสตร์, กีฬา, บันเทิง. "
@@ -41,7 +40,6 @@ def generate_daily_news(ai_client, model_id: str, company: Optional[Dict[str, An
     )
     data = _safe_json(resp.choices[0].message.content)
     items = data.get("news") or []
-    # normalize and clamp count
     out = []
     for it in items[:8]:
         out.append({

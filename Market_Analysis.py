@@ -9,23 +9,8 @@ def _safe_json(txt: str) -> dict:
         return {}
 
 def analyze_market_only(ai_client, model_id: str, news_items: List[Dict[str, Any]], company: Dict[str, Any] | None = None) -> dict:
-    """
-    Input: news_items like [{category, headline, blurb}]
-    Output JSON:
-    {
-      "summary": str,
-      "sentiment": "bullish"|"bearish"|"mixed",
-      "themes": [str],
-      "sectors": [str],
-      "risks": [str],
-      "opportunities": [str],
-      "watchlist": [str]
-    }
-    Thai prompts. Keys in English for stable parsing.
-    """
-    # Pack news into compact lines for the model
     lines = [f"- [{it.get('category','')}] {it.get('headline','').strip()} — {it.get('blurb','').strip()}" for it in news_items]
-    news_text = "\n".join(lines[:12])  # clamp size
+    news_text = "\n".join(lines[:12])
 
     company_clause = ""
     if company and company.get("name"):
@@ -40,8 +25,8 @@ def analyze_market_only(ai_client, model_id: str, news_items: List[Dict[str, Any
         "จงวิเคราะห์เฉพาะประเด็นที่เกี่ยวกับ 'ตลาดหุ้น' จากรายการข่าวต่อไปนี้ "
         "ข้ามข่าวที่ไม่ใช่หุ้น เช่น บันเทิงทั่วไป "
         + company_clause +
-        "ให้สรุปภาพรวมตลาดแบบกระชับ ระบุธีมสำคัญ กลุ่มอุตสาหกรรมที่เด่น/เสี่ยง ความเสี่ยงเชิงมหภาค/จุลภาค "
-        "และโอกาสที่น่าสนใจ พร้อมรายการ 'watchlist' เป็นชื่อธีมหรือสมมติชื่อหุ้นสั้นๆ 3-6 รายการ.\n\n"
+        "ให้สรุปภาพรวมตลาดแบบกระชับ ระบุธีมสำคัญ กลุ่มอุตสาหกรรมที่เด่น/เสี่ยง ความเสี่ยง และโอกาส "
+        "พร้อม 'watchlist' 3-6 รายการ.\n\n"
         "รายการข่าว:\n" + news_text
     )
 
@@ -52,7 +37,6 @@ def analyze_market_only(ai_client, model_id: str, news_items: List[Dict[str, Any
         temperature=0.6
     )
     data = _safe_json(resp.choices[0].message.content)
-    # minimal normalization
     out = {
         "summary": (data.get("summary") or "").strip(),
         "sentiment": (data.get("sentiment") or "mixed").strip(),
