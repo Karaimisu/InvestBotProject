@@ -1,11 +1,12 @@
 # main.py
 from dotenv import load_dotenv
-import os, json
+import os, json, asyncio
 from pathlib import Path
 import pandas as pd
 import discord
 from discord.ext import commands
 from discord import Interaction, File, Embed, app_commands
+from discord.errors import NotFound, HTTPException
 from openai import OpenAI
 
 from User_Data import load_or_create_excel, get_user_money, set_user_money
@@ -40,8 +41,24 @@ intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="=", intents=intents)
 
+# --- safe defer/send helpers to avoid Unknown interaction 10062 ---
+async def safe_defer(interaction: Interaction, *, ephemeral: bool = True, thinking: bool = True):
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral, thinking=thinking)
+    except (NotFound, HTTPException):
+        pass
 
-# --- Helper for reading chart trend ---
+async def safe_followup(interaction: Interaction, **kwargs):
+    try:
+        return await interaction.followup.send(**kwargs)
+    except NotFound:
+        kwargs.pop("ephemeral", None)
+        return await interaction.channel.send(**kwargs)
+    except HTTPException:
+        return None
+
+# --- chart trend detector ---
 def _trend_from_csv(csv_path: str) -> str:
     try:
         df = pd.read_csv(csv_path)
@@ -50,8 +67,7 @@ def _trend_from_csv(csv_path: str) -> str:
             return "sideways"
         y = df["Close"].values
         x = pd.Series(range(len(y))).values
-        xm = x.mean()
-        ym = y.mean()
+        xm = x.mean(); ym = y.mean()
         denom = ((x - xm) ** 2).sum() or 1.0
         slope = ((x - xm) * (y - ym)).sum() / denom
         sma_fast = pd.Series(y).rolling(10).mean().iloc[-1]
@@ -66,8 +82,7 @@ def _trend_from_csv(csv_path: str) -> str:
     except Exception:
         return "sideways"
 
-
-# --- Main Game View ---
+# --- interactive view ---
 class InvestView(discord.ui.View):
     def __init__(self, ai_client, model_id: str, user_id: int, username: str, money: int, scenario: Scenario,
                  excel_path: str, requested_amount: int, trend: str, clamped_note: str | None):
@@ -85,8 +100,7 @@ class InvestView(discord.ui.View):
         self.round_finished = False
 
     async def _ensure_deferred(self, interaction: Interaction, ephemeral: bool = True):
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=ephemeral, thinking=True)
+        await safe_defer(interaction, ephemeral=ephemeral, thinking=True)
 
     def _lock_buttons(self):
         for child in self.children:
@@ -95,34 +109,29 @@ class InvestView(discord.ui.View):
 
     async def _handle_choice(self, interaction: Interaction, choice: str):
         if interaction.user.id != self.user_id:
-            await interaction.response.send_message("This session belongs to another user.", ephemeral=True)
+            await safe_followup(interaction, content="This session belongs to another user.", ephemeral=True)
             return
 
         await self._ensure_deferred(interaction, ephemeral=True)
 
-        # --- News reading ---
         if choice == "Read News":
             news = generate_news(self.ai, self.scenario, model_id=self.model_id)
             items = news["items"]
             brief = news["brief"]
-            desc_items = "\n".join(
-                [f"• **{it.get('headline', '')}** — {it.get('blurb', '')}" for it in items]
-            ) or "ไม่มีข่าว"
+            desc_items = "\n".join([f"• **{it.get('headline','')}** — {it.get('blurb','')}" for it in items]) or "ไม่มีข่าว"
             pros = "\n".join(f"• {p}" for p in brief.get("pros", [])[:5]) or "—"
             cons = "\n".join(f"• {c}" for c in brief.get("cons", [])[:5]) or "—"
             sigs = "\n".join(f"• {s}" for s in brief.get("signals", [])[:5]) or "—"
-
             embed = Embed(title="📰 ข่าวเพื่อช่วยตัดสินใจ", description=desc_items, color=discord.Color.dark_teal())
             embed.add_field(name="สัญญาณสนับสนุน (Pros)", value=pros, inline=False)
             embed.add_field(name="สัญญาณต้าน (Cons)", value=cons, inline=False)
             embed.add_field(name="ตัวชี้วัด/เบาะแส", value=sigs, inline=False)
-            embed.set_footer(text=f"อคติรวมของข่าว: {brief.get('bias', 'mixed')}")
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            embed.set_footer(text=f"อคติรวมของข่าว: {brief.get('bias','mixed')}")
+            await safe_followup(interaction, embed=embed, ephemeral=True)
             return
 
-        # --- Trade choice (only once) ---
         if self.round_finished:
-            await interaction.followup.send("คุณได้เลือกไปแล้ว โปรดเริ่มรอบใหม่ด้วย /invest", ephemeral=True)
+            await safe_followup(interaction, content="คุณได้เลือกไปแล้ว โปรดเริ่มรอบใหม่ด้วย /invest", ephemeral=True)
             return
 
         new_money, pnl, size, _ = simulate_outcome(
@@ -132,17 +141,17 @@ class InvestView(discord.ui.View):
         self.money = new_money
         self.round_finished = True
         self._lock_buttons()
+        try:
+            if interaction.message:
+                await interaction.message.edit(view=self)
+        except (NotFound, HTTPException):
+            pass
 
-        tip_reason = generate_tip_and_reason(
-            self.ai, self.scenario, choice, pnl, size, self.trend, model_id=self.model_id
-        )
+        tip_reason = generate_tip_and_reason(self.ai, self.scenario, choice, pnl, size, self.trend, model_id=self.model_id)
 
         sign = "+" if pnl >= 0 else "-"
         pnl_str = f"{sign}${abs(pnl):,}"
-        desc = [
-            f"คำตอบที่ถูกต้องคือ: **{self.scenario.correct_action}**",
-            tip_reason
-        ]
+        desc = [f"คำตอบที่ถูกต้องคือ: **{self.scenario.correct_action}**", tip_reason]
         if self.clamped_note:
             desc.append(self.clamped_note)
 
@@ -155,8 +164,7 @@ class InvestView(discord.ui.View):
         embed.add_field(name="ขนาดสถานะ", value=f"${size:,}", inline=True)
         embed.add_field(name="ยอดเงินใหม่", value=f"${new_money:,}", inline=True)
 
-        await interaction.message.edit(view=self)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await safe_followup(interaction, embed=embed, ephemeral=True)
 
     @discord.ui.button(label="Buy", style=discord.ButtonStyle.primary)
     async def buy(self, interaction: Interaction, button: discord.ui.Button):
@@ -174,19 +182,15 @@ class InvestView(discord.ui.View):
     async def news(self, interaction: Interaction, button: discord.ui.Button):
         await self._handle_choice(interaction, "Read News")
 
-
-# --- Ready Event ---
 @bot.event
 async def on_ready():
     await bot.tree.sync()
     print("------- Bot Started -------")
 
-
-# --- Invest Command ---
 @bot.tree.command(name="invest", description="เริ่มสถานการณ์การลงทุน (ต้องระบุจำนวนเงินลงทุน)")
 @app_commands.describe(amount="จำนวนเงินที่ต้องการลงทุน (พิมพ์หรือเลือกจากรายการ)")
 async def invest(interaction: Interaction, amount: int):
-    await interaction.response.defer(thinking=True)
+    await safe_defer(interaction, ephemeral=False, thinking=True)
 
     user_id = interaction.user.id
     username = interaction.user.name
@@ -225,11 +229,10 @@ async def invest(interaction: Interaction, amount: int):
     if os.path.exists(png_path):
         file = File(png_path, filename=os.path.basename(png_path))
         em.set_image(url=f"attachment://{os.path.basename(png_path)}")
-        await interaction.followup.send(embed=em, view=view, file=file)
+        await safe_followup(interaction, embed=em, view=view, file=file)
     else:
-        await interaction.followup.send(embed=em, view=view)
+        await safe_followup(interaction, embed=em, view=view)
 
-# --- Autocomplete for amount ---
 @invest.autocomplete("amount")
 async def amount_autocomplete(interaction: Interaction, current: str):
     try:
@@ -246,7 +249,7 @@ async def amount_autocomplete(interaction: Interaction, current: str):
 
 @bot.tree.command(name="dailynews", description="ข่าวประจำวันแนวหนังสือพิมพ์ พร้อมพาดพิงบริษัทสมมติล่าสุด")
 async def dailynews(interaction: Interaction):
-    await interaction.response.defer(thinking=True)
+    await safe_defer(interaction, ephemeral=False, thinking=True)
 
     company_info = None
     try:
@@ -258,7 +261,7 @@ async def dailynews(interaction: Interaction):
 
     items = generate_daily_news(AI, MODEL_ID, company=company_info)
     if not items:
-        await interaction.followup.send("ยังสร้างข่าวไม่สำเร็จ ลองอีกครั้ง", ephemeral=True)
+        await safe_followup(interaction, content="ยังสร้างข่าวไม่สำเร็จ ลองอีกครั้ง")
         return
 
     try:
@@ -275,11 +278,11 @@ async def dailynews(interaction: Interaction):
     )
     if company_info and company_info.get("name"):
         embed.set_footer(text=f"รวมข่าวเกี่ยวกับ: {company_info['name']} ({company_info.get('sector','')})")
-    await interaction.followup.send(embed=embed)
+    await safe_followup(interaction, embed=embed)
 
 @bot.tree.command(name="marketanalysis", description="วิเคราะห์เฉพาะประเด็นตลาดหุ้นจากข่าวประจำวัน")
 async def marketanalysis(interaction: Interaction):
-    await interaction.response.defer(thinking=True)
+    await safe_defer(interaction, ephemeral=False, thinking=True)
 
     company_info = None
     try:
@@ -306,7 +309,7 @@ async def marketanalysis(interaction: Interaction):
             pass
 
     if not news_items:
-        await interaction.followup.send("ไม่มีข่าวให้วิเคราะห์ ลองรัน /dailynews ก่อน", ephemeral=True)
+        await safe_followup(interaction, content="ไม่มีข่าวให้วิเคราะห์ ลองรัน /dailynews ก่อน")
         return
 
     analysis = analyze_market_only(AI, MODEL_ID, news_items, company_info)
@@ -336,21 +339,22 @@ async def marketanalysis(interaction: Interaction):
     if company_info and company_info.get("name"):
         em.set_footer(text=f"พาดพิงบริษัท: {company_info['name']} ({company_info.get('sector','')})")
 
-    await interaction.followup.send(embed=em)
+    await safe_followup(interaction, embed=em)
 
 @bot.tree.command(name="rebuildkb", description="สร้างดัชนีคลังความรู้ใหม่ (ผู้ดูแล)")
 async def rebuildkb(interaction: Interaction):
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    await safe_defer(interaction, ephemeral=True, thinking=True)
     files, chunks = rebuild_index()
-    await interaction.followup.send(f"สร้างดัชนีแล้ว: ไฟล์ {files} ชิ้นส่วน {chunks}", ephemeral=True)
+    await safe_followup(interaction, content=f"สร้างดัชนีแล้ว: ไฟล์ {files} ชิ้นส่วน {chunks}", ephemeral=True)
 
 @bot.tree.command(name="askinvest", description="ถามเรื่องตลาดหุ้น/การลงทุนจากคลังความรู้ภายใน")
 @app_commands.describe(question="คำถามของคุณ")
 async def askinvest(interaction: Interaction, question: str):
-    await interaction.response.defer(thinking=True)
+    await safe_defer(interaction, ephemeral=False, thinking=True)
     result = answer_investing_question(AI, MODEL_ID, question, k=6)
     answer = result["answer"]
     refs = result["refs"]
+    label = result.get("refs_label", "References")
 
     em = Embed(
         title="💬 ที่ปรึกษาการลงทุน (ฐานความรู้ภายใน)",
@@ -359,9 +363,9 @@ async def askinvest(interaction: Interaction, question: str):
     )
     if refs:
         ref_lines = [f"[{r['n']}] {r['title']} — {r['source']}" for r in refs[:10]]
-        em.add_field(name="อ้างอิง", value="\n".join(ref_lines)[:1024], inline=False)
+        em.add_field(name=label, value="\n".join(ref_lines)[:1024], inline=False)
 
-    await interaction.followup.send(embed=em)
+    await safe_followup(interaction, embed=em)
 
 if __name__ == "__main__":
     if not TOKEN:

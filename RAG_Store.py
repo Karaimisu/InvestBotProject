@@ -1,6 +1,7 @@
 # RAG_Store.py
 from __future__ import annotations
-import os, json, re
+import os, json, re, time
+from contextlib import suppress
 from pathlib import Path
 from typing import List, Dict, Tuple
 from dataclasses import dataclass
@@ -23,7 +24,7 @@ INDEX_PATH = RAG_DIR / "index.faiss"
 META_PATH = RAG_DIR / "meta.json"
 STORE_PATH = RAG_DIR / "store.jsonl"
 
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 EMB_DIM = 384
 
 @dataclass
@@ -79,6 +80,36 @@ def _chunk(text: str, max_tokens: int = 700, overlap: int = 100) -> List[str]:
 def _title_from_path(p: Path) -> str:
     return p.stem.replace("_", " ").strip()
 
+def _retry(times=5, delay=0.25):
+    def deco(fn):
+        def wrap(*a, **k):
+            last = None
+            for _ in range(times):
+                try:
+                    return fn(*a, **k)
+                except (PermissionError, OSError) as e:
+                    last = e
+                    time.sleep(delay)
+            if last:
+                raise last
+        return wrap
+    return deco
+
+@_retry(times=5, delay=0.25)
+def _atomic_write_index(index, path: Path):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    faiss.write_index(index, str(tmp))
+    if tmp.exists() and tmp.stat().st_size > 0:
+        with suppress(Exception):
+            test = faiss.read_index(str(tmp))
+            del test
+        tmp.replace(path)
+    else:
+        raise RuntimeError("Failed to write FAISS index")
+
+def _meta_write(obj: dict):
+    META_PATH.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
 def rebuild_index() -> Tuple[int, int]:
     files = []
     for ext in ("*.pdf", "*.md", "*.markdown", "*.html", "*.htm", "*.txt"):
@@ -99,22 +130,23 @@ def rebuild_index() -> Tuple[int, int]:
                 text=part
             ))
 
+    model = SentenceTransformer(MODEL_NAME)
+
     if not docs:
         index = faiss.IndexFlatIP(EMB_DIM)
-        faiss.write_index(index, str(INDEX_PATH))
-        META_PATH.write_text(json.dumps({"emb_model": MODEL_NAME, "count": 0}, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_index(index, INDEX_PATH)
+        _meta_write({"emb_model": MODEL_NAME, "count": 0})
         STORE_PATH.write_text("", encoding="utf-8")
         return 0, 0
 
-    model = SentenceTransformer(MODEL_NAME)
     embs = model.encode([d.text for d in docs], batch_size=64, show_progress_bar=False, normalize_embeddings=True)
     embs = np.asarray(embs, dtype="float32")
 
     index = faiss.IndexFlatIP(EMB_DIM)
     index.add(embs)
-    faiss.write_index(index, str(INDEX_PATH))
+    _atomic_write_index(index, INDEX_PATH)
 
-    META_PATH.write_text(json.dumps({"emb_model": MODEL_NAME, "count": len(docs)}, ensure_ascii=False, indent=2), encoding="utf-8")
+    _meta_write({"emb_model": MODEL_NAME, "count": len(docs)})
     with open(STORE_PATH, "w", encoding="utf-8") as f:
         for d in docs:
             f.write(json.dumps(d.__dict__, ensure_ascii=False) + "\n")
@@ -122,30 +154,62 @@ def rebuild_index() -> Tuple[int, int]:
     return len(files), len(docs)
 
 def _load_store():
-    if not INDEX_PATH.exists():
+    if (not INDEX_PATH.exists()) or INDEX_PATH.stat().st_size == 0:
         rebuild_index()
-    index = faiss.read_index(str(INDEX_PATH))
+    try:
+        meta = json.loads(META_PATH.read_text(encoding="utf-8"))
+        if meta.get("emb_model") != MODEL_NAME:
+            rebuild_index()
+    except Exception:
+        rebuild_index()
+
+    try:
+        index = faiss.read_index(str(INDEX_PATH))
+    except Exception:
+        rebuild_index()
+        index = faiss.read_index(str(INDEX_PATH))
+
     chunks: List[Chunk] = []
-    if STORE_PATH.exists():
+    if STORE_PATH.exists() and STORE_PATH.stat().st_size > 0:
         with open(STORE_PATH, "r", encoding="utf-8") as f:
             for line in f:
-                if not line.strip():
-                    continue
-                obj = json.loads(line)
-                chunks.append(Chunk(**obj))
+                if line.strip():
+                    obj = json.loads(line)
+                    chunks.append(Chunk(**obj))
     return index, chunks
 
+_MODEL_SINGLETON = None
+def _get_model():
+    global _MODEL_SINGLETON
+    if _MODEL_SINGLETON is None:
+        _MODEL_SINGLETON = SentenceTransformer(MODEL_NAME)
+    return _MODEL_SINGLETON
+
 def _embed(texts: List[str]) -> np.ndarray:
-    model = SentenceTransformer(MODEL_NAME)
+    model = _get_model()
     X = model.encode(texts, batch_size=32, show_progress_bar=False, normalize_embeddings=True)
     return np.asarray(X, dtype="float32")
 
 def retrieve(query: str, k: int = 6) -> List[Dict]:
-    index, store = _load_store()
+    try:
+        index, store = _load_store()
+    except Exception:
+        rebuild_index()
+        index, store = _load_store()
+
     if not store or index.ntotal == 0:
         return []
+
     q = _embed([query])
-    D, I = index.search(q, min(k, index.ntotal))
+    try:
+        D, I = index.search(q, min(k, index.ntotal))
+    except Exception:
+        rebuild_index()
+        index, store = _load_store()
+        if not store or index.ntotal == 0:
+            return []
+        D, I = index.search(q, min(k, index.ntotal))
+
     out = []
     for idx, score in zip(I[0], D[0]):
         if idx == -1:

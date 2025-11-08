@@ -15,4 +15,4 @@ def resolve_model(client: OpenAI, env_model: str | None):
             return ids[0]
     except Exception:
         pass
-    return "typhoon-v1"
+    return "typhoon-v1"                                             
