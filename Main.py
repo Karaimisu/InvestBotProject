@@ -397,19 +397,28 @@ async def on_ready():
 @bot.tree.command(name="invest", description="เริ่มสถานการณ์การลงทุน (ต้องระบุจำนวนเงินลงทุน)")
 @app_commands.describe(amount="จำนวนเงินที่ต้องการลงทุน")
 async def invest(interaction: Interaction, amount: int):
-    # Remove "Generating scenario..." as requested. Ack silently.
-    await safe_defer(interaction, ephemeral=False, thinking=False)
+    # Do NOT defer here. Build first, then send exactly once.
 
     user_id = interaction.user.id
     username = interaction.user.name
     money = get_user_money(user_id, username, excel_path)
 
-    # Generate graph and read PNG into memory to avoid file handle issues
+    # Generate graph and read PNG into memory to avoid file-handle issues
     graph = generate_stock_graph()
     company, sector = graph["company"], graph["sector"]
     png_path = graph["png_path"]; csv_path = graph["csv_path"]
-    file_obj = _file_from_path(png_path)  # BytesIO-backed File
     trend = _trend_from_csv(csv_path)
+
+    # Read file into memory buffer so it remains open during send
+    file_obj = None
+    try:
+        with open(png_path, "rb") as f:
+            from io import BytesIO
+            buf = BytesIO(f.read())
+            buf.seek(0)
+            file_obj = File(buf, filename=os.path.basename(png_path))
+    except Exception:
+        file_obj = None
 
     with open(LAST_COMPANY_PATH, "w", encoding="utf-8") as f:
         json.dump({"name": company, "sector": sector}, f, ensure_ascii=False)
@@ -434,12 +443,13 @@ async def invest(interaction: Interaction, amount: int):
 
     view = InvestView(AI, MODEL_ID, user_id, username, money, scenario, excel_path, invest_amount, trend, clamped_note)
 
+    # Send exactly once using response.send_message
     if file_obj:
         em.set_image(url=f"attachment://{file_obj.filename}")
-        await safe_followup(interaction, embed=em, view=view, file=file_obj)
+        await interaction.response.send_message(embed=em, view=view, file=file_obj)
     else:
-        await safe_followup(interaction, embed=em, view=view)
-
+        await interaction.response.send_message(embed=em, view=view)
+        
 @bot.tree.command(name="dailynews", description="ข่าวตลาดหุ้นจริงแบบอัปเดตรายวัน (สรุปไทย)")
 async def dailynews(interaction: Interaction):
     await safe_defer(interaction, ephemeral=False, thinking=False)
