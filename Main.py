@@ -1,6 +1,7 @@
 # main.py
 from dotenv import load_dotenv
 import os, json, asyncio
+from io import BytesIO
 from pathlib import Path
 import pandas as pd
 import discord
@@ -47,8 +48,7 @@ intents.members = True
 bot = commands.Bot(command_prefix="=", intents=intents)
 
 # ------------------- helpers -------------------
-async def safe_defer(interaction: Interaction, *, ephemeral: bool = True, thinking: bool = False):
-    # Use thinking=False for instant ACK to avoid timeouts
+async def safe_defer(interaction: Interaction, *, ephemeral: bool = False, thinking: bool = False):
     try:
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=ephemeral, thinking=thinking)
@@ -56,7 +56,6 @@ async def safe_defer(interaction: Interaction, *, ephemeral: bool = True, thinki
         pass
 
 async def ensure_button_ack(interaction: Interaction, *, ephemeral: bool = True):
-    # ACK buttons instantly to avoid "application did not respond"
     try:
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=ephemeral, thinking=False)
@@ -67,21 +66,7 @@ async def safe_followup(interaction: Interaction, **kwargs):
     try:
         return await interaction.followup.send(**kwargs)
     except NotFound:
-        # Webhook token expired; fall back to channel.send
         kwargs.pop("ephemeral", None)
-
-        def reopen_file(f: discord.File) -> discord.File:
-            path = getattr(getattr(f, "fp", None), "name", None)
-            filename = getattr(f, "filename", None)
-            if path and os.path.isfile(path):
-                return discord.File(path, filename=filename or os.path.basename(path))
-            return f
-
-        if "file" in kwargs and isinstance(kwargs["file"], discord.File):
-            kwargs["file"] = reopen_file(kwargs["file"])
-        if "files" in kwargs and isinstance(kwargs["files"], (list, tuple)):
-            kwargs["files"] = [reopen_file(f) for f in kwargs["files"]]
-
         return await interaction.channel.send(**kwargs)
     except HTTPException:
         return None
@@ -109,16 +94,20 @@ def _trend_from_csv(csv_path: str) -> str:
     except Exception:
         return "sideways"
 
-# percentage-based analysis fee
 def _news_analysis_cost_by_difficulty(difficulty: int, bankroll: int) -> int:
-    """
-    Difficulty 1..5 -> 0.5%, 1.0%, 1.5%, 2.0%, 2.5% of |bankroll|.
-    Minimum $1. Works with negative balances by abs().
-    """
     difficulty = max(1, min(5, int(difficulty)))
     rate_table = {1: 0.005, 2: 0.01, 3: 0.015, 4: 0.02, 5: 0.025}
     rate = rate_table[difficulty]
     return max(1, int(abs(bankroll) * rate))
+
+def _file_from_path(path: str) -> File | None:
+    try:
+        with open(path, "rb") as f:
+            buf = BytesIO(f.read())
+        buf.seek(0)
+        return File(buf, filename=os.path.basename(path))
+    except Exception:
+        return None
 
 # ------------------- background news refresh -------------------
 async def news_refresher_loop():
@@ -157,7 +146,6 @@ class InvestView(discord.ui.View):
             if isinstance(child, discord.ui.Button) and child.custom_id != "read_news":
                 child.disabled = True
 
-    # NEWS FIRST: show 5–7 company-focused items + paid-analysis button
     async def _send_news_embed_with_button(self, interaction: Interaction, news: dict):
         items = news.get("items", [])
         shown = items[:7] if len(items) >= 5 else items
@@ -192,7 +180,6 @@ class InvestView(discord.ui.View):
             return
 
         if choice == "Read News":
-            # Generate and cache more company-focused news; target 5–7 items
             if not self.news_shown:
                 batches = []
                 for _ in range(3):
@@ -262,7 +249,7 @@ class InvestView(discord.ui.View):
             await safe_followup(interaction, content="คุณได้เลือกไปแล้ว โปรดเริ่มรอบใหม่ด้วย /invest", ephemeral=True)
             return
 
-        # Simulate result
+        # Simulate
         new_money, pnl, size, _ = simulate_outcome(
             choice, self.scenario, self.money, requested_amount=self.requested_amount
         )
@@ -278,7 +265,6 @@ class InvestView(discord.ui.View):
 
         tip_reason = generate_tip_and_reason(self.ai, self.scenario, choice, pnl, size, self.trend, model_id=self.model_id)
 
-        # P&L percentage relative to invested amount
         invested = max(1, int(self.requested_amount))
         pnl_pct = (pnl / invested) * 100.0
         sign = "+" if pnl >= 0 else "-"
@@ -295,12 +281,11 @@ class InvestView(discord.ui.View):
             color=discord.Color.green() if pnl >= 0 else discord.Color.red()
         )
         embed.add_field(name="P&L (เทียบเงินที่ลงทุน)", value=pnl_pct_str, inline=True)
-        embed.add_field(name="P&L มูลค่า", value=pnl_abs_str, inline=True)  # optional
+        embed.add_field(name="P&L มูลค่า", value=pnl_abs_str, inline=True)
         embed.add_field(name="ขนาดสถานะ", value=f"${size:,}", inline=True)
         embed.add_field(name="ยอดเงินใหม่", value=f"${new_money:,}", inline=True)
         await safe_followup(interaction, embed=embed, ephemeral=True)
 
-    # Only after user presses the button do we charge and show analysis + tips
     async def run_paid_analysis(self, interaction: Interaction):
         if interaction.user.id != self.user_id:
             await safe_followup(interaction, content="This session belongs to another user.", ephemeral=True)
@@ -312,7 +297,6 @@ class InvestView(discord.ui.View):
             await safe_followup(interaction, content="คุณได้กดวิเคราะห์ไปแล้วสำหรับรอบนี้", ephemeral=True)
             return
 
-        # percentage-based fee from current money
         cost = _news_analysis_cost_by_difficulty(self.scenario.difficulty, self.money)
         new_money = self.money - cost
         set_user_money(self.user_id, self.excel_path, new_money)
@@ -413,16 +397,18 @@ async def on_ready():
 @bot.tree.command(name="invest", description="เริ่มสถานการณ์การลงทุน (ต้องระบุจำนวนเงินลงทุน)")
 @app_commands.describe(amount="จำนวนเงินที่ต้องการลงทุน")
 async def invest(interaction: Interaction, amount: int):
-    # Instant ACK to avoid timeouts while generating graph/scenario
+    # Remove "Generating scenario..." as requested. Ack silently.
     await safe_defer(interaction, ephemeral=False, thinking=False)
 
     user_id = interaction.user.id
     username = interaction.user.name
     money = get_user_money(user_id, username, excel_path)
 
+    # Generate graph and read PNG into memory to avoid file handle issues
     graph = generate_stock_graph()
     company, sector = graph["company"], graph["sector"]
     png_path = graph["png_path"]; csv_path = graph["csv_path"]
+    file_obj = _file_from_path(png_path)  # BytesIO-backed File
     trend = _trend_from_csv(csv_path)
 
     with open(LAST_COMPANY_PATH, "w", encoding="utf-8") as f:
@@ -447,10 +433,10 @@ async def invest(interaction: Interaction, amount: int):
     em.add_field(name="ลงทุนรอบนี้", value=f"${invest_amount:,}", inline=True)
 
     view = InvestView(AI, MODEL_ID, user_id, username, money, scenario, excel_path, invest_amount, trend, clamped_note)
-    if os.path.exists(png_path):
-        file = File(png_path, filename=os.path.basename(png_path))
-        em.set_image(url=f"attachment://{os.path.basename(png_path)}")
-        await safe_followup(interaction, embed=em, view=view, file=file)
+
+    if file_obj:
+        em.set_image(url=f"attachment://{file_obj.filename}")
+        await safe_followup(interaction, embed=em, view=view, file=file_obj)
     else:
         await safe_followup(interaction, embed=em, view=view)
 
