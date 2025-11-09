@@ -47,10 +47,19 @@ intents.members = True
 bot = commands.Bot(command_prefix="=", intents=intents)
 
 # ------------------- helpers -------------------
-async def safe_defer(interaction: Interaction, *, ephemeral: bool = True, thinking: bool = True):
+async def safe_defer(interaction: Interaction, *, ephemeral: bool = True, thinking: bool = False):
+    # Use thinking=False for instant ACK to avoid timeouts
     try:
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=ephemeral, thinking=thinking)
+    except (NotFound, HTTPException):
+        pass
+
+async def ensure_button_ack(interaction: Interaction, *, ephemeral: bool = True):
+    # ACK buttons instantly to avoid "application did not respond"
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=ephemeral, thinking=False)
     except (NotFound, HTTPException):
         pass
 
@@ -104,7 +113,7 @@ def _trend_from_csv(csv_path: str) -> str:
 def _news_analysis_cost_by_difficulty(difficulty: int, bankroll: int) -> int:
     """
     Difficulty 1..5 -> 0.5%, 1.0%, 1.5%, 2.0%, 2.5% of |bankroll|.
-    Minimum $1. Works if balance is negative by using abs().
+    Minimum $1. Works with negative balances by abs().
     """
     difficulty = max(1, min(5, int(difficulty)))
     rate_table = {1: 0.005, 2: 0.01, 3: 0.015, 4: 0.02, 5: 0.025}
@@ -142,9 +151,6 @@ class InvestView(discord.ui.View):
         self.news_shown = False
         self.analysis_done = False
         self._cached_news = None  # {items, brief}
-
-    async def _ensure_deferred(self, interaction: Interaction, ephemeral: bool = True):
-        await safe_defer(interaction, ephemeral=ephemeral, thinking=True)
 
     def _lock_main_buttons(self):
         for child in self.children:
@@ -184,8 +190,6 @@ class InvestView(discord.ui.View):
         if interaction.user.id != self.user_id:
             await safe_followup(interaction, content="This session belongs to another user.", ephemeral=True)
             return
-
-        await self._ensure_deferred(interaction, ephemeral=True)
 
         if choice == "Read News":
             # Generate and cache more company-focused news; target 5–7 items
@@ -250,8 +254,6 @@ class InvestView(discord.ui.View):
                         base_brief = b["brief"]; break
                 self._cached_news = {"items": merged, "brief": base_brief or {"bias": "mixed", "pros": [], "cons": [], "signals": []}}
                 self.news_shown = True
-            else:
-                news = self._cached_news
 
             await self._send_news_embed_with_button(interaction, self._cached_news)
             return
@@ -260,6 +262,7 @@ class InvestView(discord.ui.View):
             await safe_followup(interaction, content="คุณได้เลือกไปแล้ว โปรดเริ่มรอบใหม่ด้วย /invest", ephemeral=True)
             return
 
+        # Simulate result
         new_money, pnl, size, _ = simulate_outcome(
             choice, self.scenario, self.money, requested_amount=self.requested_amount
         )
@@ -274,8 +277,14 @@ class InvestView(discord.ui.View):
             pass
 
         tip_reason = generate_tip_and_reason(self.ai, self.scenario, choice, pnl, size, self.trend, model_id=self.model_id)
+
+        # P&L percentage relative to invested amount
+        invested = max(1, int(self.requested_amount))
+        pnl_pct = (pnl / invested) * 100.0
         sign = "+" if pnl >= 0 else "-"
-        pnl_str = f"{sign}${abs(pnl):,}"
+        pnl_pct_str = f"{sign}{abs(pnl_pct):.2f}%"
+        pnl_abs_str = f"{sign}${abs(pnl):,}"
+
         desc = [f"คำตอบที่ถูกต้องคือ: **{self.scenario.correct_action}**", tip_reason]
         if self.clamped_note:
             desc.append(self.clamped_note)
@@ -285,15 +294,14 @@ class InvestView(discord.ui.View):
             description="\n\n".join(desc),
             color=discord.Color.green() if pnl >= 0 else discord.Color.red()
         )
-        embed.add_field(name="P&L", value=pnl_str, inline=True)
+        embed.add_field(name="P&L (เทียบเงินที่ลงทุน)", value=pnl_pct_str, inline=True)
+        embed.add_field(name="P&L มูลค่า", value=pnl_abs_str, inline=True)  # optional
         embed.add_field(name="ขนาดสถานะ", value=f"${size:,}", inline=True)
         embed.add_field(name="ยอดเงินใหม่", value=f"${new_money:,}", inline=True)
         await safe_followup(interaction, embed=embed, ephemeral=True)
 
     # Only after user presses the button do we charge and show analysis + tips
     async def run_paid_analysis(self, interaction: Interaction):
-        await self._ensure_deferred(interaction, ephemeral=True)
-
         if interaction.user.id != self.user_id:
             await safe_followup(interaction, content="This session belongs to another user.", ephemeral=True)
             return
@@ -352,18 +360,22 @@ class InvestView(discord.ui.View):
 
     @discord.ui.button(label="Buy", style=discord.ButtonStyle.primary)
     async def buy(self, interaction: Interaction, button: discord.ui.Button):
+        await ensure_button_ack(interaction, ephemeral=True)
         await self._handle_choice(interaction, "Buy")
 
     @discord.ui.button(label="Sell", style=discord.ButtonStyle.primary)
     async def sell(self, interaction: Interaction, button: discord.ui.Button):
+        await ensure_button_ack(interaction, ephemeral=True)
         await self._handle_choice(interaction, "Sell")
 
     @discord.ui.button(label="Hold", style=discord.ButtonStyle.secondary)
     async def hold(self, interaction: Interaction, button: discord.ui.Button):
+        await ensure_button_ack(interaction, ephemeral=True)
         await self._handle_choice(interaction, "Hold")
 
     @discord.ui.button(label="Read News", style=discord.ButtonStyle.success, custom_id="read_news")
     async def news(self, interaction: Interaction, button: discord.ui.Button):
+        await ensure_button_ack(interaction, ephemeral=True)
         await self._handle_choice(interaction, "Read News")
 
 
@@ -377,6 +389,7 @@ class NewsAnalysisView(discord.ui.View):
         style=discord.ButtonStyle.danger
     )
     async def analyze(self, interaction: Interaction, button: discord.ui.Button):
+        await ensure_button_ack(interaction, ephemeral=True)
         await self.parent.run_paid_analysis(interaction)
         for child in self.children:
             if isinstance(child, discord.ui.Button):
@@ -400,7 +413,8 @@ async def on_ready():
 @bot.tree.command(name="invest", description="เริ่มสถานการณ์การลงทุน (ต้องระบุจำนวนเงินลงทุน)")
 @app_commands.describe(amount="จำนวนเงินที่ต้องการลงทุน")
 async def invest(interaction: Interaction, amount: int):
-    await safe_defer(interaction, ephemeral=False, thinking=True)
+    # Instant ACK to avoid timeouts while generating graph/scenario
+    await safe_defer(interaction, ephemeral=False, thinking=False)
 
     user_id = interaction.user.id
     username = interaction.user.name
@@ -442,7 +456,7 @@ async def invest(interaction: Interaction, amount: int):
 
 @bot.tree.command(name="dailynews", description="ข่าวตลาดหุ้นจริงแบบอัปเดตรายวัน (สรุปไทย)")
 async def dailynews(interaction: Interaction):
-    await safe_defer(interaction, ephemeral=False, thinking=True)
+    await safe_defer(interaction, ephemeral=False, thinking=False)
     items = load_today_news(DATA_DIR)
     if not items:
         try:
@@ -463,14 +477,14 @@ async def dailynews(interaction: Interaction):
 
 @bot.tree.command(name="rebuildkb", description="สร้างดัชนีคลังความรู้ใหม่ (ผู้ดูแล)")
 async def rebuildkb(interaction: Interaction):
-    await safe_defer(interaction, ephemeral=True, thinking=True)
+    await safe_defer(interaction, ephemeral=True, thinking=False)
     files, chunks = rebuild_index()
     await safe_followup(interaction, content=f"สร้างดัชนีแล้ว: ไฟล์ {files} ชิ้นส่วน {chunks}", ephemeral=True)
 
 @bot.tree.command(name="askinvest", description="ถามเรื่องตลาดหุ้น/การลงทุนจากคลังความรู้ภายใน")
 @app_commands.describe(question="คำถามของคุณ (ตอบเป็นภาษาไทย)")
 async def askinvest(interaction: Interaction, question: str):
-    await safe_defer(interaction, ephemeral=False, thinking=True)
+    await safe_defer(interaction, ephemeral=False, thinking=False)
     result = answer_investing_question(AI, MODEL_ID, question, k=6)
     answer = result["answer"]; refs = result["refs"]; label = result.get("refs_label", "อ้างอิง")
     em = Embed(
