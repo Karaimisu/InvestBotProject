@@ -9,6 +9,7 @@ from discord import Interaction, File, Embed, app_commands
 from discord.errors import NotFound, HTTPException
 from openai import OpenAI
 
+# --- local modules ---
 from User_Data import load_or_create_excel, get_user_money, set_user_money
 from Invest_Logic import (
     generate_scenario, generate_news, simulate_outcome,
@@ -16,16 +17,20 @@ from Invest_Logic import (
 )
 from GenGraph import generate_stock_graph
 from Model_Util import resolve_model
-from Daily_News import generate_daily_news
-from Market_Analysis import analyze_market_only
 from RAG_Chat import answer_investing_question
 from RAG_Store import rebuild_index
+from Daily_News import (
+    refresh_daily_news_real, load_today_news, seconds_until_next_refresh,  # live
+    generate_daily_news  # synthetic fallback
+)
 
+# ------------------- env -------------------
 load_dotenv()
-
 TOKEN = os.getenv("Bot_Token")
 TYPHOON_KEY = os.getenv("Typhoon_Key")
 TYPHOON_MODEL_ENV = os.getenv("Typhoon_Model")
+NEWS_REFRESH_HHMM = os.getenv("NEWS_REFRESH_HHMM", "08:00")
+NEWS_HH, NEWS_MM = map(int, NEWS_REFRESH_HHMM.split(":"))
 
 AI = OpenAI(api_key=TYPHOON_KEY, base_url="https://api.opentyphoon.ai/v1")
 MODEL_ID = resolve_model(AI, TYPHOON_MODEL_ENV)
@@ -34,14 +39,14 @@ excel_path = load_or_create_excel()
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 LAST_COMPANY_PATH = DATA_DIR / "last_company.json"
-LAST_NEWS_PATH = DATA_DIR / "last_daily_news.json"
 
+# ------------------- discord -------------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="=", intents=intents)
 
-# --- safe defer/send helpers to avoid Unknown interaction 10062 ---
+# ------------------- helpers -------------------
 async def safe_defer(interaction: Interaction, *, ephemeral: bool = True, thinking: bool = True):
     try:
         if not interaction.response.is_done():
@@ -53,12 +58,25 @@ async def safe_followup(interaction: Interaction, **kwargs):
     try:
         return await interaction.followup.send(**kwargs)
     except NotFound:
+        # Webhook token expired; fall back to channel.send
         kwargs.pop("ephemeral", None)
+
+        def reopen_file(f: discord.File) -> discord.File:
+            path = getattr(getattr(f, "fp", None), "name", None)
+            filename = getattr(f, "filename", None)
+            if path and os.path.isfile(path):
+                return discord.File(path, filename=filename or os.path.basename(path))
+            return f
+
+        if "file" in kwargs and isinstance(kwargs["file"], discord.File):
+            kwargs["file"] = reopen_file(kwargs["file"])
+        if "files" in kwargs and isinstance(kwargs["files"], (list, tuple)):
+            kwargs["files"] = [reopen_file(f) for f in kwargs["files"]]
+
         return await interaction.channel.send(**kwargs)
     except HTTPException:
         return None
 
-# --- chart trend detector ---
 def _trend_from_csv(csv_path: str) -> str:
     try:
         df = pd.read_csv(csv_path)
@@ -82,7 +100,29 @@ def _trend_from_csv(csv_path: str) -> str:
     except Exception:
         return "sideways"
 
-# --- interactive view ---
+# percentage-based analysis fee
+def _news_analysis_cost_by_difficulty(difficulty: int, bankroll: int) -> int:
+    """
+    Difficulty 1..5 -> 0.5%, 1.0%, 1.5%, 2.0%, 2.5% of |bankroll|.
+    Minimum $1. Works if balance is negative by using abs().
+    """
+    difficulty = max(1, min(5, int(difficulty)))
+    rate_table = {1: 0.005, 2: 0.01, 3: 0.015, 4: 0.02, 5: 0.025}
+    rate = rate_table[difficulty]
+    return max(1, int(abs(bankroll) * rate))
+
+# ------------------- background news refresh -------------------
+async def news_refresher_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            refresh_daily_news_real(AI, MODEL_ID, DATA_DIR)
+        except Exception:
+            pass
+        delay = seconds_until_next_refresh(NEWS_HH, NEWS_MM)
+        await asyncio.sleep(max(60, delay))
+
+# ------------------- views -------------------
 class InvestView(discord.ui.View):
     def __init__(self, ai_client, model_id: str, user_id: int, username: str, money: int, scenario: Scenario,
                  excel_path: str, requested_amount: int, trend: str, clamped_note: str | None):
@@ -97,15 +137,48 @@ class InvestView(discord.ui.View):
         self.requested_amount = requested_amount
         self.trend = trend
         self.clamped_note = clamped_note
+
         self.round_finished = False
+        self.news_shown = False
+        self.analysis_done = False
+        self._cached_news = None  # {items, brief}
 
     async def _ensure_deferred(self, interaction: Interaction, ephemeral: bool = True):
         await safe_defer(interaction, ephemeral=ephemeral, thinking=True)
 
-    def _lock_buttons(self):
+    def _lock_main_buttons(self):
         for child in self.children:
-            if isinstance(child, discord.ui.Button):
+            if isinstance(child, discord.ui.Button) and child.custom_id != "read_news":
                 child.disabled = True
+
+    # NEWS FIRST: show 5–7 company-focused items + paid-analysis button
+    async def _send_news_embed_with_button(self, interaction: Interaction, news: dict):
+        items = news.get("items", [])
+        shown = items[:7] if len(items) >= 5 else items
+        desc_items = "\n".join([
+            f"• **{it.get('headline','')}** — {it.get('blurb','')}"
+            for it in shown
+        ]) or "ไม่มีข่าว"
+
+        cost = _news_analysis_cost_by_difficulty(self.scenario.difficulty, self.money)
+        pct_map = {1: 0.5, 2: 1.0, 3: 1.5, 4: 2.0, 5: 2.5}
+        pct = pct_map.get(int(self.scenario.difficulty), 1.0)
+
+        disclaimer = (
+            f"\n\n⚠️ **หมายเหตุ**: หากกดปุ่ม '**วิเคราะห์ & คำแนะนำ**' "
+            f"ระบบจะหักเงิน **{pct:.1f}%** ของยอดเงินปัจจุบัน ≈ **${cost:,}** "
+            f"ตามระดับความยาก เพื่อแสดงสรุปเชิงลึกและคำแนะนำเชิงการเรียนรู้"
+        )
+
+        embed = Embed(
+            title="📰 ข่าวเพื่อช่วยตัดสินใจ (โฟกัสบริษัทจำลอง)",
+            description=desc_items + disclaimer,
+            color=discord.Color.dark_teal()
+        )
+        embed.set_footer(text="นี่คือสรุปข่าวเท่านั้น ยังไม่รวมการวิเคราะห์เชิงลึก")
+
+        view = NewsAnalysisView(self)
+        await safe_followup(interaction, embed=embed, view=view, ephemeral=True)
 
     async def _handle_choice(self, interaction: Interaction, choice: str):
         if interaction.user.id != self.user_id:
@@ -115,19 +188,72 @@ class InvestView(discord.ui.View):
         await self._ensure_deferred(interaction, ephemeral=True)
 
         if choice == "Read News":
-            news = generate_news(self.ai, self.scenario, model_id=self.model_id)
-            items = news["items"]
-            brief = news["brief"]
-            desc_items = "\n".join([f"• **{it.get('headline','')}** — {it.get('blurb','')}" for it in items]) or "ไม่มีข่าว"
-            pros = "\n".join(f"• {p}" for p in brief.get("pros", [])[:5]) or "—"
-            cons = "\n".join(f"• {c}" for c in brief.get("cons", [])[:5]) or "—"
-            sigs = "\n".join(f"• {s}" for s in brief.get("signals", [])[:5]) or "—"
-            embed = Embed(title="📰 ข่าวเพื่อช่วยตัดสินใจ", description=desc_items, color=discord.Color.dark_teal())
-            embed.add_field(name="สัญญาณสนับสนุน (Pros)", value=pros, inline=False)
-            embed.add_field(name="สัญญาณต้าน (Cons)", value=cons, inline=False)
-            embed.add_field(name="ตัวชี้วัด/เบาะแส", value=sigs, inline=False)
-            embed.set_footer(text=f"อคติรวมของข่าว: {brief.get('bias','mixed')}")
-            await safe_followup(interaction, embed=embed, ephemeral=True)
+            # Generate and cache more company-focused news; target 5–7 items
+            if not self.news_shown:
+                batches = []
+                for _ in range(3):
+                    try:
+                        batches.append(generate_news(self.ai, self.scenario, model_id=self.model_id))
+                    except Exception:
+                        pass
+                if not batches:
+                    batches = [{"items": [], "brief": {"bias": "mixed", "pros": [], "cons": [], "signals": []}}]
+
+                seen = set()
+                merged = []
+                company = self.scenario.name.split(" — ")[0] if " — " in self.scenario.name else self.scenario.name
+                company_low = company.lower()
+
+                def score_item(it):
+                    h = (it.get("headline") or "").lower()
+                    b = (it.get("blurb") or "").lower()
+                    s = 0
+                    if company_low in h: s += 3
+                    if company_low in b: s += 2
+                    if self.scenario.sector and (self.scenario.sector.lower() in h or self.scenario.sector.lower() in b):
+                        s += 1
+                    return s
+
+                for batch in batches:
+                    for it in batch.get("items", []):
+                        h = (it.get("headline") or "").strip()
+                        if not h or h in seen:
+                            continue
+                        seen.add(h)
+                        blurb = (it.get("blurb") or "").strip()
+                        if company_low not in blurb.lower():
+                            it["blurb"] = f"{blurb} (เกี่ยวข้องกับ {company})" if blurb else f"อัปเดตที่เกี่ยวข้องกับ {company}"
+                        merged.append(it)
+
+                merged.sort(key=score_item, reverse=True)
+                if len(merged) < 5:
+                    try:
+                        extra = generate_news(self.ai, self.scenario, model_id=self.model_id).get("items", [])
+                        for it in extra:
+                            h = (it.get("headline") or "").strip()
+                            if h and h not in seen:
+                                seen.add(h)
+                                blurb = (it.get("blurb") or "").strip()
+                                if company_low not in blurb.lower():
+                                    it["blurb"] = f"{blurb} (เกี่ยวข้องกับ {company})" if blurb else f"อัปเดตที่เกี่ยวข้องกับ {company}"
+                                merged.append(it)
+                    except Exception:
+                        pass
+                    merged.sort(key=score_item, reverse=True)
+
+                target_n = 7 if len(merged) >= 7 else max(5, len(merged))
+                merged = merged[:target_n]
+
+                base_brief = {}
+                for b in batches:
+                    if b.get("brief"):
+                        base_brief = b["brief"]; break
+                self._cached_news = {"items": merged, "brief": base_brief or {"bias": "mixed", "pros": [], "cons": [], "signals": []}}
+                self.news_shown = True
+            else:
+                news = self._cached_news
+
+            await self._send_news_embed_with_button(interaction, self._cached_news)
             return
 
         if self.round_finished:
@@ -140,7 +266,7 @@ class InvestView(discord.ui.View):
         set_user_money(self.user_id, self.excel_path, new_money)
         self.money = new_money
         self.round_finished = True
-        self._lock_buttons()
+        self._lock_main_buttons()
         try:
             if interaction.message:
                 await interaction.message.edit(view=self)
@@ -148,7 +274,6 @@ class InvestView(discord.ui.View):
             pass
 
         tip_reason = generate_tip_and_reason(self.ai, self.scenario, choice, pnl, size, self.trend, model_id=self.model_id)
-
         sign = "+" if pnl >= 0 else "-"
         pnl_str = f"{sign}${abs(pnl):,}"
         desc = [f"คำตอบที่ถูกต้องคือ: **{self.scenario.correct_action}**", tip_reason]
@@ -163,8 +288,67 @@ class InvestView(discord.ui.View):
         embed.add_field(name="P&L", value=pnl_str, inline=True)
         embed.add_field(name="ขนาดสถานะ", value=f"${size:,}", inline=True)
         embed.add_field(name="ยอดเงินใหม่", value=f"${new_money:,}", inline=True)
-
         await safe_followup(interaction, embed=embed, ephemeral=True)
+
+    # Only after user presses the button do we charge and show analysis + tips
+    async def run_paid_analysis(self, interaction: Interaction):
+        await self._ensure_deferred(interaction, ephemeral=True)
+
+        if interaction.user.id != self.user_id:
+            await safe_followup(interaction, content="This session belongs to another user.", ephemeral=True)
+            return
+        if not self.news_shown or not self._cached_news:
+            await safe_followup(interaction, content="ยังไม่มีข่าวสำหรับการวิเคราะห์ โปรดกด Read News ก่อน", ephemeral=True)
+            return
+        if self.analysis_done:
+            await safe_followup(interaction, content="คุณได้กดวิเคราะห์ไปแล้วสำหรับรอบนี้", ephemeral=True)
+            return
+
+        # percentage-based fee from current money
+        cost = _news_analysis_cost_by_difficulty(self.scenario.difficulty, self.money)
+        new_money = self.money - cost
+        set_user_money(self.user_id, self.excel_path, new_money)
+        self.money = new_money
+        self.analysis_done = True
+
+        brief = self._cached_news.get("brief", {})
+        pros = brief.get("pros", [])[:5]
+        cons = brief.get("cons", [])[:5]
+        sigs = brief.get("signals", [])[:5]
+        bias = brief.get("bias", "mixed")
+
+        tip_reason = generate_tip_and_reason(
+            self.ai, self.scenario, "Analyze", -cost, cost, self.trend, model_id=self.model_id
+        )
+
+        rec_hint = {
+            "bullish": "แนวโน้มข่าวเอียงเชิงบวก: ฝึกพิจารณา Buy หรือรอจังหวะย่อที่ยืนยันด้วยปริมาณ",
+            "bearish": "แนวโน้มข่าวเอียงเชิงลบ: ฝึกพิจารณา Sell/หลีกเลี่ยง จนกว่าจะมีสัญญาณกลับตัวชัด",
+            "mixed": "แนวโน้มข่าวผสม: ฝึก Hold/ลดขนาดสถานะ รอสัญญาณชัดขึ้น"
+        }.get(bias, "แนวโน้มไม่ชัด: ฝึกรอการยืนยันจากราคา/ปริมาณเพิ่มเติม")
+
+        sections = []
+        if pros:
+            sections.append("**ปัจจัยหนุนที่ตรวจพบ**\n" + "\n".join(f"• {p}" for p in pros))
+        if cons:
+            sections.append("**ปัจจัยกดดันที่ตรวจพบ**\n" + "\n".join(f"• {c}" for c in cons))
+        if sigs:
+            sections.append("**ตัวชี้วัด/สัญญาณที่ควรจับตา**\n" + "\n".join(f"• {s}" for s in sigs))
+
+        sections.append(f"**สรุปแนวโน้มข่าวรวม:** {bias}")
+        sections.append(f"**แนวทางเชิงการเรียนรู้:** {rec_hint}")
+        sections.append("**คำอธิบายเหตุผลของทิศทาง (TIP & REASON)**\n" + tip_reason)
+        sections.append(
+            f"\n💸 ค่าบริการการวิเคราะห์ถูกหักแล้ว: **-${cost:,}**  | ยอดเงินคงเหลือ: **${self.money:,}**\n"
+            "🛑 เนื้อหานี้เพื่อการศึกษาเท่านั้น ไม่ใช่คำแนะนำการลงทุนจริง"
+        )
+
+        em = Embed(
+            title="🔍 วิเคราะห์เชิงลึก & คำแนะนำจากข่าว",
+            description="\n\n".join(sections),
+            color=discord.Color.dark_orange()
+        )
+        await safe_followup(interaction, embed=em, ephemeral=True)
 
     @discord.ui.button(label="Buy", style=discord.ButtonStyle.primary)
     async def buy(self, interaction: Interaction, button: discord.ui.Button):
@@ -178,17 +362,43 @@ class InvestView(discord.ui.View):
     async def hold(self, interaction: Interaction, button: discord.ui.Button):
         await self._handle_choice(interaction, "Hold")
 
-    @discord.ui.button(label="Read News", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Read News", style=discord.ButtonStyle.success, custom_id="read_news")
     async def news(self, interaction: Interaction, button: discord.ui.Button):
         await self._handle_choice(interaction, "Read News")
 
+
+class NewsAnalysisView(discord.ui.View):
+    def __init__(self, parent: InvestView):
+        super().__init__(timeout=180)
+        self.parent = parent
+
+    @discord.ui.button(
+        label="วิเคราะห์ & คำแนะนำ (เสียเงินตามความยาก)",
+        style=discord.ButtonStyle.danger
+    )
+    async def analyze(self, interaction: Interaction, button: discord.ui.Button):
+        await self.parent.run_paid_analysis(interaction)
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+        try:
+            if interaction.message:
+                await interaction.message.edit(view=self)
+        except (NotFound, HTTPException):
+            pass
+
+# ------------------- lifecycle -------------------
 @bot.event
 async def on_ready():
     await bot.tree.sync()
+    if not getattr(bot, "_news_loop_started", False):
+        bot._news_loop_started = True
+        bot.loop.create_task(news_refresher_loop())
     print("------- Bot Started -------")
 
+# ------------------- commands -------------------
 @bot.tree.command(name="invest", description="เริ่มสถานการณ์การลงทุน (ต้องระบุจำนวนเงินลงทุน)")
-@app_commands.describe(amount="จำนวนเงินที่ต้องการลงทุน (พิมพ์หรือเลือกจากรายการ)")
+@app_commands.describe(amount="จำนวนเงินที่ต้องการลงทุน")
 async def invest(interaction: Interaction, amount: int):
     await safe_defer(interaction, ephemeral=False, thinking=True)
 
@@ -198,15 +408,13 @@ async def invest(interaction: Interaction, amount: int):
 
     graph = generate_stock_graph()
     company, sector = graph["company"], graph["sector"]
-    png_path = graph["png_path"]
-    csv_path = graph["csv_path"]
+    png_path = graph["png_path"]; csv_path = graph["csv_path"]
     trend = _trend_from_csv(csv_path)
 
     with open(LAST_COMPANY_PATH, "w", encoding="utf-8") as f:
         json.dump({"name": company, "sector": sector}, f, ensure_ascii=False)
 
     scenario = generate_scenario(AI, company, sector, money, model_id=MODEL_ID)
-
     cap = compute_trade_size(10**9, money, scenario.difficulty)
     invest_amount = max(100, min(amount, cap))
     clamped_note = None
@@ -225,7 +433,6 @@ async def invest(interaction: Interaction, amount: int):
     em.add_field(name="ลงทุนรอบนี้", value=f"${invest_amount:,}", inline=True)
 
     view = InvestView(AI, MODEL_ID, user_id, username, money, scenario, excel_path, invest_amount, trend, clamped_note)
-
     if os.path.exists(png_path):
         file = File(png_path, filename=os.path.basename(png_path))
         em.set_image(url=f"attachment://{os.path.basename(png_path)}")
@@ -233,113 +440,26 @@ async def invest(interaction: Interaction, amount: int):
     else:
         await safe_followup(interaction, embed=em, view=view)
 
-@invest.autocomplete("amount")
-async def amount_autocomplete(interaction: Interaction, current: str):
-    try:
-        money = get_user_money(interaction.user.id, interaction.user.name, excel_path)
-        diff_guess = balanced_difficulty(money)
-        cap_guess = compute_trade_size(10**9, money, diff_guess)
-        return [
-            app_commands.Choice(name=f"สูงสุด ~ ${cap_guess:,}", value=cap_guess),
-            app_commands.Choice(name=f"ครึ่งหนึ่ง ~ ${cap_guess//2:,}", value=max(100, cap_guess//2)),
-            app_commands.Choice(name="ขั้นต่ำ $100", value=100),
-        ]
-    except Exception:
-        return [app_commands.Choice(name="ขั้นต่ำ $100", value=100)]
-
-@bot.tree.command(name="dailynews", description="ข่าวประจำวันแนวหนังสือพิมพ์ พร้อมพาดพิงบริษัทสมมติล่าสุด")
+@bot.tree.command(name="dailynews", description="ข่าวตลาดหุ้นจริงแบบอัปเดตรายวัน (สรุปไทย)")
 async def dailynews(interaction: Interaction):
     await safe_defer(interaction, ephemeral=False, thinking=True)
-
-    company_info = None
-    try:
-        if LAST_COMPANY_PATH.exists():
-            with open(LAST_COMPANY_PATH, "r", encoding="utf-8") as f:
-                company_info = json.load(f)
-    except Exception:
-        company_info = None
-
-    items = generate_daily_news(AI, MODEL_ID, company=company_info)
+    items = load_today_news(DATA_DIR)
     if not items:
-        await safe_followup(interaction, content="ยังสร้างข่าวไม่สำเร็จ ลองอีกครั้ง")
+        try:
+            items = refresh_daily_news_real(AI, MODEL_ID, DATA_DIR)
+        except Exception:
+            items = []
+    if not items:
+        await safe_followup(interaction, content="วันนี้ยังไม่มีข่าวที่ดึงมาได้ ลองใหม่ภายหลัง")
         return
-
-    try:
-        with open(LAST_NEWS_PATH, "w", encoding="utf-8") as f:
-            json.dump(items, f, ensure_ascii=False)
-    except Exception:
-        pass
-
-    lines = [f"• **[{it.get('category','')}] {it.get('headline','')}** — {it.get('blurb','')}" for it in items]
+    lines = [f"• **{it['headline']}** — {it['blurb']}  \n{it['source']} • {it['published'][:10]}" for it in items]
     embed = Embed(
-        title="🗞️ ข่าวประจำวัน",
-        description="\n".join(lines),
+        title="🗞️ ข่าวตลาดหุ้นวันนี้ (สรุปไทย)",
+        description="\n\n".join(lines[:10]),
         color=discord.Color.dark_gold()
     )
-    if company_info and company_info.get("name"):
-        embed.set_footer(text=f"รวมข่าวเกี่ยวกับ: {company_info['name']} ({company_info.get('sector','')})")
+    embed.set_footer(text=f"อัปเดตเวลา {NEWS_HH:02d}:{NEWS_MM:02d} น. (Asia/Bangkok) • ไม่แสดงซ้ำภายในวัน")
     await safe_followup(interaction, embed=embed)
-
-@bot.tree.command(name="marketanalysis", description="วิเคราะห์เฉพาะประเด็นตลาดหุ้นจากข่าวประจำวัน")
-async def marketanalysis(interaction: Interaction):
-    await safe_defer(interaction, ephemeral=False, thinking=True)
-
-    company_info = None
-    try:
-        if LAST_COMPANY_PATH.exists():
-            with open(LAST_COMPANY_PATH, "r", encoding="utf-8") as f:
-                company_info = json.load(f)
-    except Exception:
-        company_info = None
-
-    news_items = None
-    try:
-        if LAST_NEWS_PATH.exists():
-            with open(LAST_NEWS_PATH, "r", encoding="utf-8") as f:
-                news_items = json.load(f)
-    except Exception:
-        news_items = None
-
-    if not news_items:
-        news_items = generate_daily_news(AI, MODEL_ID, company=company_info)
-        try:
-            with open(LAST_NEWS_PATH, "w", encoding="utf-8") as f:
-                json.dump(news_items, f, ensure_ascii=False)
-        except Exception:
-            pass
-
-    if not news_items:
-        await safe_followup(interaction, content="ไม่มีข่าวให้วิเคราะห์ ลองรัน /dailynews ก่อน")
-        return
-
-    analysis = analyze_market_only(AI, MODEL_ID, news_items, company_info)
-    sent = analysis.get("sentiment", "mixed").lower()
-    color = discord.Color.gold()
-    if sent == "bullish":
-        color = discord.Color.green()
-    elif sent == "bearish":
-        color = discord.Color.red()
-
-    em = Embed(
-        title="📊 วิเคราะห์ตลาดหุ้นจากข่าววันนี้",
-        description=analysis.get("summary", "") or "ไม่มีสรุป",
-        color=color
-    )
-    if analysis.get("themes"):
-        em.add_field(name="ธีมเด่น", value="• " + "\n• ".join(analysis["themes"]), inline=False)
-    if analysis.get("sectors"):
-        em.add_field(name="กลุ่มอุตสาหกรรม", value="• " + "\n• ".join(analysis["sectors"]), inline=False)
-    if analysis.get("risks"):
-        em.add_field(name="ความเสี่ยง", value="• " + "\n• ".join(analysis["risks"]), inline=False)
-    if analysis.get("opportunities"):
-        em.add_field(name="โอกาส", value="• " + "\n• ".join(analysis["opportunities"]), inline=False)
-    if analysis.get("watchlist"):
-        em.add_field(name="Watchlist", value="• " + "\n• ".join(analysis["watchlist"]), inline=False)
-
-    if company_info and company_info.get("name"):
-        em.set_footer(text=f"พาดพิงบริษัท: {company_info['name']} ({company_info.get('sector','')})")
-
-    await safe_followup(interaction, embed=em)
 
 @bot.tree.command(name="rebuildkb", description="สร้างดัชนีคลังความรู้ใหม่ (ผู้ดูแล)")
 async def rebuildkb(interaction: Interaction):
@@ -348,14 +468,11 @@ async def rebuildkb(interaction: Interaction):
     await safe_followup(interaction, content=f"สร้างดัชนีแล้ว: ไฟล์ {files} ชิ้นส่วน {chunks}", ephemeral=True)
 
 @bot.tree.command(name="askinvest", description="ถามเรื่องตลาดหุ้น/การลงทุนจากคลังความรู้ภายใน")
-@app_commands.describe(question="คำถามของคุณ")
+@app_commands.describe(question="คำถามของคุณ (ตอบเป็นภาษาไทย)")
 async def askinvest(interaction: Interaction, question: str):
     await safe_defer(interaction, ephemeral=False, thinking=True)
     result = answer_investing_question(AI, MODEL_ID, question, k=6)
-    answer = result["answer"]
-    refs = result["refs"]
-    label = result.get("refs_label", "References")
-
+    answer = result["answer"]; refs = result["refs"]; label = result.get("refs_label", "อ้างอิง")
     em = Embed(
         title="💬 ที่ปรึกษาการลงทุน (ฐานความรู้ภายใน)",
         description=answer[:4000],
@@ -364,12 +481,10 @@ async def askinvest(interaction: Interaction, question: str):
     if refs:
         ref_lines = [f"[{r['n']}] {r['title']} — {r['source']}" for r in refs[:10]]
         em.add_field(name=label, value="\n".join(ref_lines)[:1024], inline=False)
-
     await safe_followup(interaction, embed=em)
 
+# ------------------- run -------------------
 if __name__ == "__main__":
-    if not TOKEN:
-        raise SystemExit("Missing Bot_Token in environment.")
-    if not TYPHOON_KEY:
-        raise SystemExit("Missing Typhoon_Key in environment.")
+    if not TOKEN: raise SystemExit("Missing Bot_Token in environment.")
+    if not TYPHOON_KEY: raise SystemExit("Missing Typhoon_Key in environment.")
     bot.run(TOKEN)

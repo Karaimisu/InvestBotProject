@@ -21,7 +21,7 @@ M019,knowledge,Currency depreciation,When a currency weakens relative to others.
 M020,knowledge,Trade deficit,"When imports exceed exports, creating negative balance of trade.","macro,trade"
 M021,knowledge,Trade surplus,"When exports exceed imports, creating positive balance of trade.","macro,trade"
 M022,knowledge,Commodities market,"Market for physical goods like oil, gold, and wheat. Prices driven by supply and demand.","markets,commodities"
-M023,knowledge,Oil prices,"Energy costs affect inflation, transport, and industrial profits.","markets,energy"
+M023,knowledge, ,"Energy costs affect inflation, transport, and industrial profits.","markets,energy"
 M024,knowledge,Gold as safe haven,Investors often buy gold during uncertainty to preserve value.,"markets,gold"
 M025,knowledge,Hedge funds,Investment partnerships using advanced strategies for higher returns.,"finance,funds"
 M026,knowledge,Mutual funds,"Pooled investments managed by professionals, priced once daily.","finance,funds"

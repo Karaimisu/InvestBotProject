@@ -1,0 +1,49 @@
+{
+  "444402052022665219": {
+    "username": "elemisu.",
+    "created_at": "2025-11-09T04:17:27Z",
+    "trades": 2,
+    "wins": 1,
+    "losses": 1,
+    "ties": 0,
+    "total_pnl": -2429,
+    "streak": 1,
+    "last_play_date": "2025-11-09",
+    "last_actions": [
+      {
+        "ts": "2025-11-09T05:38:19Z",
+        "action": "Sell",
+        "pnl": 400,
+        "size": 750,
+        "correct": false,
+        "company": "Neo Enterprises (HPIP)",
+        "sector": "Aerospace",
+        "tone": "mixed",
+        "difficulty": 4
+      },
+      {
+        "ts": "2025-11-09T04:20:33Z",
+        "action": "Sell",
+        "pnl": -2829,
+        "size": 100000,
+        "correct": false,
+        "company": "Solaris Logistics (JAT)",
+        "sector": "Finance",
+        "tone": "mixed",
+        "difficulty": 4
+      }
+    ]
+  },
+  "718033989901877320": {
+    "username": "chaisartsin",
+    "created_at": "2025-11-09T04:21:12Z",
+    "trades": 0,
+    "wins": 0,
+    "losses": 0,
+    "ties": 0,
+    "total_pnl": 0,
+    "streak": 0,
+    "last_play_date": null,
+    "last_actions": []
+  }
+}
