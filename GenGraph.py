@@ -1,134 +1,131 @@
 # GenGraph.py
-from pathlib import Path
+import os
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import random, string, time
+import matplotlib
+matplotlib.use("Agg")  # headless, low RAM
+import matplotlib.pyplot as plt
+from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_OUT = REPO_ROOT / "data" / "graphs"
+DATA_DIR = Path(__file__).resolve().parent / "data" / "graphs"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 seed = int(time.time() * 1000) % 2**32
 np.random.seed(seed)
 random.seed(seed)
 
+PREFIXES = ["Nova","Luna","Apex","Vertex","Quantum","Neo","Omega","Atlas","Vera","Zenix","Orion","Titan","Horizon","Helix","Pioneer","Ardent","Skyline","Solaris","Aurora","Equinox","Momentum","Eclipse","Polaris","Zenith","Fusion","Summit","Ignite","Evolve","Nimbus","Cascade","Cobalt","Falcon","Crimson","Obsidian","Sierra","Catalyst","Infinite","Vortex","Sable"]
+SUFFIXES = ["Corp","Holdings","Industries","Systems","Group","Enterprises","Labs","Capital","Technologies","Partners","Resources","Networks","Logistics","Dynamics","Solutions","Power","Media","Energy","Pharma","Finance"]
+SECTORS  = ["Energy","Tech","Pharma","Finance","Aerospace","Retail","Automotive","Materials","Telecom","Biotech","Crypto","AI","Food","Construction","Defense"]
+
 def random_stock_name():
-    prefixes = [
-        "Nova","Luna","Apex","Vertex","Quantum","Neo","Omega","Atlas","Vera","Zenix",
-        "Orion","Titan","Horizon","Helix","Pioneer","Ardent","Skyline","Solaris","Aurora","Equinox",
-        "Momentum","Vertex","Eclipse","Polaris","Zenith","Fusion","Summit","Ignite","Evolve","Nimbus",
-        "Cascade","Cobalt","Falcon","Crimson","Obsidian","Sierra","Catalyst","Infinite","Vortex","Sable"
-    ]
-    suffixes = [
-        "Corp","Holdings","Industries","Systems","Group","Enterprises","Labs","Capital","Technologies",
-        "Partners","Resources","Networks","Logistics","Dynamics","Solutions","Power","Media","Energy","Pharma","Finance"
-    ]
-    sectors = [
-        "Energy","Tech","Pharma","Finance","Aerospace","Retail","Automotive","Materials",
-        "Telecom","Biotech","Crypto","AI","Food","Construction","Defense"
-    ]
-    name = f"{random.choice(prefixes)} {random.choice(suffixes)}"
+    name = f"{random.choice(PREFIXES)} {random.choice(SUFFIXES)}"
     symbol = ''.join(random.choices(string.ascii_uppercase, k=random.randint(3, 4)))
-    sector = random.choice(sectors)
+    sector = random.choice(SECTORS)
     return f"{name} ({symbol})", sector
 
-def trading_days(start_date=None, days=252):
-    if start_date is None:
-        start_date = datetime.now().date() - timedelta(days=int(days * 1.5))
+def trading_days(days=252):
+    start_date = datetime.utcnow().date() - timedelta(days=int(days * 1.5))
     dates = []
-    cur = pd.Timestamp(start_date)
+    cur = np.datetime64(start_date)
     while len(dates) < days:
-        if cur.weekday() < 5:
+        weekday = (cur.astype('datetime64[D]').astype(int) + 4) % 7  # 0=Mon
+        if weekday < 5:
             dates.append(cur)
-        cur += pd.Timedelta(days=1)
-    return pd.DatetimeIndex(dates[-days:])
+        cur = cur + np.timedelta64(1, 'D')
+    return np.array(dates[-days:], dtype='datetime64[D]')
 
 def simulate_stock(start_price=100.0, days=252, mu=0.10, sigma=0.25,
-                   jump_prob=0.02, jump_mu=-0.02, jump_sigma=0.08,
-                   vol_clustering=True, momentum_strength=0.3,
-                   mean_reversion_prob=0.05):
+                   jump_prob=0.02, jump_mu=-0.02, jump_sigma=0.08):
     dt = 1 / 252
     mu_d = mu * dt
     sigma_d = sigma * np.sqrt(dt)
-    prices = np.empty(days)
+    prices = np.empty(days, dtype=np.float32)
     prices[0] = start_price
-    recent_var = sigma_d ** 2
-    alpha = 0.05
-    last_return = 0.0
+    last_ret = 0.0
     for t in range(1, days):
-        sigma_t = np.sqrt(recent_var) * (1 + np.random.randn() * 0.1) if vol_clustering else sigma_d
-        sigma_t = max(1e-4, sigma_t)
-        seasonal_factor = 1 + 0.1 * np.sin(2 * np.pi * t / 252)
-        shock = np.random.randn() * sigma_t
-        jump = np.random.normal(loc=jump_mu, scale=jump_sigma) if np.random.rand() < jump_prob else 0.0
-        momentum = momentum_strength * last_return
-        if np.random.rand() < mean_reversion_prob:
+        shock = np.random.randn() * sigma_d
+        jump = np.random.normal(jump_mu, jump_sigma) if np.random.rand() < jump_prob else 0.0
+        momentum = 0.25 * last_ret
+        if np.random.rand() < 0.05:
             momentum *= -1
-        log_return = (mu_d * seasonal_factor - 0.5 * sigma_t**2) + shock + jump + momentum
-        prices[t] = prices[t-1] * np.exp(log_return)
-        recent_var = (1 - alpha) * recent_var + alpha * shock**2
-        last_return = log_return
+        log_r = (mu_d - 0.5 * sigma_d**2) + shock + jump + momentum
+        prices[t] = prices[t-1] * np.exp(log_r)
+        last_ret = log_r
     return prices
 
-def simulate_volume(days, avg_volume=2e6):
-    base = np.random.lognormal(mean=np.log(avg_volume), sigma=0.2, size=days)
-    noise = np.random.normal(1.0, 0.1, size=days)
-    volume = base * noise
-    spikes = int(days * 0.03)
-    if spikes > 0:
-        for i in np.random.choice(range(days), size=spikes, replace=False):
-            volume[i] *= np.random.uniform(1.5, 4.0)
-    return volume.round().astype(int)
-
-def generate_stock_graph(out_dir=DEFAULT_OUT):
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
+def generate_stock_graph(days=252):
     company_name, sector = random_stock_name()
-    days = 252
-    start_price = random.uniform(20, 500)
-    mu = random.uniform(0.05, 0.15)
-    sigma = random.uniform(0.15, 0.35)
-    jump_prob = random.uniform(0.01, 0.04)
-    jump_mu = random.uniform(-0.04, 0.01)
-    jump_sigma = random.uniform(0.05, 0.1)
+    start_price = float(np.random.uniform(20, 500))
+    mu = float(np.random.uniform(0.05, 0.15))
+    sigma = float(np.random.uniform(0.15, 0.35))
+    jump_prob = float(np.random.uniform(0.01, 0.04))
+    jump_mu = float(np.random.uniform(-0.04, 0.01))
+    jump_sigma = float(np.random.uniform(0.05, 0.1))
 
-    prices = simulate_stock(start_price, days, mu, sigma, jump_prob, jump_mu, jump_sigma)
-    dates = trading_days(days=days)
-    df = pd.DataFrame({"Date": dates, "Close": prices}).set_index("Date")
-    df["Return"] = df["Close"].pct_change()
-    df["SMA20"] = df["Close"].rolling(20).mean()
-    df["SMA50"] = df["Close"].rolling(50).mean()
-    df["Vol20"] = df["Return"].rolling(20).std() * np.sqrt(252)
-    df["Volume"] = simulate_volume(days)
-    df["Sector"] = sector
+    prices = simulate_stock(start_price, days, mu, sigma, jump_prob, jump_mu, jump_sigma).astype(np.float32)
+    dates = trading_days(days)
 
-    filename_base = (
-        company_name.replace(" ", "_")
-        .replace("(", "").replace(")", "").replace("/", "")
-    )
-    csv_path = out_dir / f"{filename_base}.csv"
-    png_path = out_dir / f"{filename_base}.png"
+    # lightweight rolling means on last window only for speed
+    s = prices
+    sma20 = np.convolve(s, np.ones(20)/20, mode="same")
+    sma50 = np.convolve(s, np.ones(50)/50, mode="same")
 
-    df.to_csv(csv_path)
+    base = DATA_DIR
+    base.mkdir(parents=True, exist_ok=True)
+    base_name = company_name.replace(" ", "_").replace("(", "").replace(")", "").replace("/", "")
+    csv_path = str(base / f"{base_name}.csv")
+    png_path = str(base / f"{base_name}.png")
 
-    plt.figure(figsize=(12, 6))
-    plt.plot(df.index, df["Close"], label="Close", linewidth=1.8)
-    plt.plot(df.index, df["SMA20"], label="SMA20", linestyle="--", linewidth=1.2)
-    plt.plot(df.index, df["SMA50"], label="SMA50", linestyle="--", linewidth=1.2)
-    plt.title(f"{company_name} — {sector} Sector")
-    plt.xlabel("Date")
-    plt.ylabel("Price ($)")
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(png_path)
-    plt.close()
+    # write CSV (Date,Close) only to keep file tiny
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write("Date,Close\n")
+        for d, p in zip(dates, prices):
+            f.write(f"{np.datetime_as_string(d, unit='D')},{p:.4f}\n")
 
-    return {
-        "company": company_name,
-        "sector": sector,
-        "csv_path": str(csv_path),
-        "png_path": str(png_path),
-    }
+    # plot
+    fig, ax = plt.subplots(figsize=(8, 4), dpi=110)
+    ax.plot(dates, prices, linewidth=1.6, label="Close")
+    ax.plot(dates, sma20, linestyle="--", linewidth=1.0, label="SMA20")
+    ax.plot(dates, sma50, linestyle="--", linewidth=1.0, label="SMA50")
+    ax.set_title(f"{company_name} — {sector}")
+    ax.set_xlabel("Date"); ax.set_ylabel("Price")
+    ax.grid(alpha=0.25); ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(png_path, bbox_inches="tight")
+    plt.close(fig)  # release RAM
+
+    return {"company": company_name, "sector": sector, "csv_path": csv_path, "png_path": png_path}
+
+def trend_from_csv(csv_path: str) -> str:
+    try:
+        # read last ~200 rows only
+        with open(csv_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()[-201:]  # header + 200
+        if len(lines) < 3:
+            return "sideways"
+        closes = []
+        for ln in lines[1:]:
+            parts = ln.strip().split(",")
+            if len(parts) >= 2:
+                try:
+                    closes.append(float(parts[1]))
+                except:
+                    pass
+        arr = np.array(closes, dtype=np.float32)
+        if arr.size < 10:
+            return "sideways"
+        x = np.arange(arr.size, dtype=np.float32)
+        xm = x.mean(); ym = arr.mean()
+        denom = np.square(x - xm).sum() or 1.0
+        slope = ((x - xm) * (arr - ym)).sum() / denom
+        sma_fast = np.convolve(arr, np.ones(10)/10, mode="valid")[-1]
+        sma_slow = np.convolve(arr, np.ones(30)/30, mode="valid")[-1] if arr.size >= 30 else arr[-1]
+        if slope > 0 and sma_fast >= sma_slow:
+            return "uptrend"
+        if slope < 0 and sma_fast <= sma_slow:
+            return "downtrend"
+        return "sideways"
+    except Exception:
+        return "sideways"

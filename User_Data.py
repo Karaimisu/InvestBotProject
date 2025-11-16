@@ -1,68 +1,132 @@
 # User_Data.py
-import time
+# Lightweight CSV store with basic stats
+
+import csv
 from pathlib import Path
-import pandas as pd
 
-REPO_ROOT = Path(__file__).resolve().parent
-DATA_DIR = REPO_ROOT / "data"
+DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-EXCEL_PATH = DATA_DIR / "users.xlsx"
-START_MONEY = 10_000
+CSV_PATH = DATA_DIR / "users.csv"
 
-def _retry_io(func, *args, **kwargs):
-    last = None
-    for _ in range(5):
-        try:
-            return func(*args, **kwargs)
-        except PermissionError as e:
-            last = e
-            time.sleep(0.25)
-    raise last
+HEADER = [
+    "user_id",
+    "username",
+    "money",
+    "rounds",
+    "total_gain",
+    "total_loss",
+    "wins",
+    "losses",
+]
 
-def _write_df(df: pd.DataFrame):
-    df = df.copy()
-    df["UserID"] = df["UserID"].astype(str)
-    df["Username"] = df["Username"].astype(str)
-    df["Money"] = df["Money"].astype(int)
-    _retry_io(df.to_excel, EXCEL_PATH, index=False)
+def load_or_create_store() -> str:
+    if not CSV_PATH.exists():
+        with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(HEADER)
+    return str(CSV_PATH)
 
-def load_or_create_excel():
-    if not EXCEL_PATH.exists():
-        df = pd.DataFrame(columns=["UserID", "Username", "Money"])
-        _write_df(df)
+def _read_all() -> dict[int, dict]:
+    rows: dict[int, dict] = {}
+    if CSV_PATH.exists():
+        with open(CSV_PATH, "r", newline="", encoding="utf-8") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                try:
+                    uid = int(row.get("user_id", "0"))
+                except ValueError:
+                    continue
+                def _iv(key, default=0):
+                    try:
+                        return int(row.get(key, default))
+                    except (TypeError, ValueError):
+                        return default
+                rows[uid] = {
+                    "username": row.get("username", "") or "",
+                    "money": _iv("money", 0),
+                    "rounds": _iv("rounds", 0),
+                    "total_gain": _iv("total_gain", 0),
+                    "total_loss": _iv("total_loss", 0),
+                    "wins": _iv("wins", 0),
+                    "losses": _iv("losses", 0),
+                }
+    return rows
+
+def _write_all(rows: dict[int, dict]):
+    with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(HEADER)
+        for uid, data in rows.items():
+            w.writerow([
+                uid,
+                data.get("username", ""),
+                int(data.get("money", 0)),
+                int(data.get("rounds", 0)),
+                int(data.get("total_gain", 0)),
+                int(data.get("total_loss", 0)),
+                int(data.get("wins", 0)),
+                int(data.get("losses", 0)),
+            ])
+
+def _ensure_row(rows: dict[int, dict], user_id: int, username: str) -> dict:
+    if user_id not in rows:
+        rows[user_id] = {
+            "username": username,
+            "money": 10000,
+            "rounds": 0,
+            "total_gain": 0,
+            "total_loss": 0,
+            "wins": 0,
+            "losses": 0,
+        }
     else:
-        df = _retry_io(pd.read_excel, EXCEL_PATH, dtype={"UserID": str, "Username": str, "Money": "Int64"})
-        if "UserID" not in df.columns:
-            df = pd.DataFrame(columns=["UserID", "Username", "Money"])
-        else:
-            df["UserID"] = df["UserID"].astype(str)
-            if "Money" in df.columns:
-                df["Money"] = df["Money"].fillna(START_MONEY).astype(int)
-            else:
-                df["Money"] = START_MONEY
-            if "Username" not in df.columns:
-                df["Username"] = ""
-        _write_df(df)
-    return str(EXCEL_PATH)
+        if username and rows[user_id].get("username") != username:
+            rows[user_id]["username"] = username
+    return rows[user_id]
 
-def _read_df():
-    return _retry_io(pd.read_excel, EXCEL_PATH, dtype={"UserID": str, "Username": str, "Money": int})
+def get_user_money(user_id: int, username: str, _store_path: str) -> int:
+    rows = _read_all()
+    row = _ensure_row(rows, user_id, username)
+    _write_all(rows)
+    return int(row.get("money", 0))
 
-def get_user_money(user_id, username, filepath):
-    uid = str(user_id)
-    df = _read_df()
-    row = df[df["UserID"] == uid]
-    if row.empty:
-        df.loc[len(df)] = [uid, str(username), START_MONEY]
-        _write_df(df)
-        return START_MONEY
-    return int(row.iloc[0]["Money"])
+def set_user_money(user_id: int, _store_path: str, money: int):
+    rows = _read_all()
+    row = _ensure_row(rows, user_id, row_username := rows.get(user_id, {}).get("username", ""))
+    # if user doesn't exist yet, row_username will be "", but that's ok
+    row["money"] = int(money)
+    rows[user_id] = row
+    _write_all(rows)
 
-def set_user_money(user_id, filepath, new_money):
-    uid = str(user_id)
-    df = _read_df()
-    if (df["UserID"] == uid).any():
-        df.loc[df["UserID"] == uid, "Money"] = int(new_money)
-    else:
-        df.loc[len(df)] = [uid, "Unknown", int(new_money)]
-    _write_df(df)
+def update_stats(user_id: int, username: str, pnl: int, _store_path: str):
+    rows = _read_all()
+    row = _ensure_row(rows, user_id, username)
+    row["rounds"] = int(row.get("rounds", 0)) + 1
+    if pnl > 0:
+        row["total_gain"] = int(row.get("total_gain", 0)) + pnl
+        row["wins"] = int(row.get("wins", 0)) + 1
+    elif pnl < 0:
+        row["total_loss"] = int(row.get("total_loss", 0)) + abs(pnl)
+        row["losses"] = int(row.get("losses", 0)) + 1
+    rows[user_id] = row
+    _write_all(rows)
+
+def get_user_stats(user_id: int, username: str, _store_path: str) -> dict:
+    # Ensure user exists
+    _ = get_user_money(user_id, username, _store_path)
+    rows = _read_all()
+    row = rows.get(user_id)
+    if not row:
+        return {
+            "username": username,
+            "money": 10000,
+            "rounds": 0,
+            "total_gain": 0,
+            "total_loss": 0,
+            "wins": 0,
+            "losses": 0,
+        }
+    return row
+
+def get_all_users(_store_path: str) -> dict[int, dict]:
+    return _read_all()

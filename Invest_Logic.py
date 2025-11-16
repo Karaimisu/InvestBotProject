@@ -1,183 +1,262 @@
 # Invest_Logic.py
-import json
-import random
 from dataclasses import dataclass
-from typing import Optional
-from openai import OpenAI  # type hint only
+import random
+from typing import Dict, Tuple
+from openai import OpenAI
 
-ACTIONS = ("Buy", "Sell", "Hold")
-DIFFICULTY_MAX = 5
 
 @dataclass
 class Scenario:
     name: str
     sector: str
-    tone: str             # 'bullish' | 'bearish' | 'mixed'
+    difficulty: int       # 1..5
+    stars: str            # "★☆☆☆☆"
+    tone: str             # bullish/bearish/mixed
     summary: str
-    difficulty: int
-    stars: str
-    correct_action: str   # one of ACTIONS
+    correct_action: str   # Buy/Sell/Hold
 
-def stars(n: int) -> str:
-    n = max(1, min(DIFFICULTY_MAX, int(n)))
-    return "★" * n + "☆" * (DIFFICULTY_MAX - n)
 
-def balanced_difficulty(money: int) -> int:
-    base = 1 if money < 5_000 else 2 if money < 15_000 else 3 if money < 30_000 else 4
-    r = random.random()
-    if r < 0.25: delta = -1
-    elif r < 0.85: delta = 0
-    elif r < 0.97: delta = +1
-    else: delta = +2
-    return max(1, min(DIFFICULTY_MAX, base + delta))
+def _stars(n: int) -> str:
+    n = max(1, min(5, int(n)))
+    return "★" * n + "☆" * (5 - n)
 
-def pick_correct_action(tone: str, difficulty: int) -> str:
-    contrarian_p = 0.05 * difficulty
-    if tone == "bullish":
-        return random.choices(["Buy", "Hold", "Sell"], weights=[1-contrarian_p, contrarian_p*0.6, contrarian_p*0.4])[0]
-    if tone == "bearish":
-        return random.choices(["Sell", "Hold", "Buy"], weights=[1-contrarian_p, contrarian_p*0.6, contrarian_p*0.4])[0]
-    return random.choices(["Hold", "Buy", "Sell"], weights=[0.7, 0.15, 0.15])[0]
 
-def _safe_parse_json(txt: str) -> dict:
+def _pick_difficulty(bankroll: int) -> int:
+    """
+    Bias toward easier scenarios but still allow hard ones even for new players.
+    """
+    base = 1 if bankroll < 5_000 else 2 if bankroll < 20_000 else 3
+    weights = {
+        1: [0.45, 0.30, 0.15, 0.07, 0.03],
+        2: [0.25, 0.35, 0.20, 0.12, 0.08],
+        3: [0.15, 0.25, 0.30, 0.20, 0.10],
+    }[base]
+    return random.choices([1, 2, 3, 4, 5], weights=weights, k=1)[0]
+
+
+def compute_trade_size(max_cap: int, bankroll: int, difficulty: int) -> int:
+    """
+    Cap the trade size based on bankroll and difficulty.
+    Uses abs(bankroll) so it still works if user money is negative.
+    """
+    difficulty = max(1, min(5, difficulty))
+    scale = {1: 0.15, 2: 0.20, 3: 0.25, 4: 0.30, 5: 0.35}[difficulty]
+    return max(100, min(int(abs(bankroll) * scale), max_cap))
+
+
+def generate_scenario(
+    ai: OpenAI,
+    company: str,
+    sector: str,
+    bankroll: int,
+    *,
+    model_id: str,
+) -> Scenario:
+    """
+    Generate scenario with tone and summary via Typhoon.
+    Correct action is derived from tone (so it’s not always Buy).
+    """
+    difficulty = _pick_difficulty(bankroll)
+
+    sys = "คุณเป็นผู้ช่วยสร้างสถานการณ์ลงทุนให้ผู้ใช้ฝึกตัดสินใจ หลีกเลี่ยงคำแนะนำเชิงส่วนบุคคล"
+    user = (
+        f"สร้างสถานการณ์จำลองหุ้นเป็นภาษาไทยแบบย่อ 3-5 บรรทัด\n"
+        f"- ชื่อบริษัท: {company}, กลุ่ม: {sector}\n"
+        f"- ระดับความยาก (1-5): {difficulty}\n"
+        f"- ให้โทนตลาด (bullish/bearish/mixed) และเหตุผลย่อ\n"
+        f"- ไม่ต้องระบุคำตอบที่ถูกต้องในข้อความ, ให้ใช้เฉพาะ tone\n"
+        f"ตอบ JSON: {{'tone':..., 'summary':...}}"
+    )
+
     try:
-        return json.loads(txt)
+        resp = ai.chat.completions.create(
+            model=model_id,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            temperature=0.4,
+            max_tokens=220,
+        )
+        txt = resp.choices[0].message.content.strip()
     except Exception:
-        return {}
+        txt = "{'tone':'mixed','summary':'ภาวะไม่ชัดเจน ราคาผันผวน'}"
 
-def generate_scenario(ai_client: OpenAI, company_name: str, sector: str, money: int, model_id: Optional[str] = None) -> Scenario:
-    diff = balanced_difficulty(money)
-    sys = (
-        "คุณคือเอนจินจำลองตลาดหุ้นสำหรับเกมสอนการเทรด "
-        "ตอบกลับเป็น JSON เท่านั้น โดยใช้คีย์: name, sector, tone, summary "
-        "tone ต้องเป็นหนึ่งใน: bullish, bearish, mixed "
-        "summary ไม่เกิน 2 ประโยค ให้สะท้อนความยาก (ความกำกวม/ปัจจัยขัดแย้งเพิ่มเมื่อยากขึ้น)"
-    )
-    user = (
-        f"สร้างสถานการณ์ของหุ้นสมมติชื่อ '{company_name}' ในอุตสาหกรรม '{sector}'. "
-        f"เป้าความยาก {diff} จาก 1-5. "
-        "ห้ามให้คำแนะนำลงทุนตรงๆ"
-    )
-    resp = ai_client.chat.completions.create(
-        model=model_id or "typhoon-v1",
-        messages=[{"role": "system", "content": sys},
-                  {"role": "user", "content": user}],
-        temperature=0.7
-    )
-    data = _safe_parse_json(resp.choices[0].message.content)
-    name = data.get("name") or company_name
-    sec = data.get("sector") or sector
-    tone = data.get("tone") if data.get("tone") in {"bullish","bearish","mixed"} else random.choice(["bullish","bearish","mixed"])
-    summary = data.get("summary") or "บริบทตลาดที่สุ่มสร้าง"
-    correct = pick_correct_action(tone, diff)
+    tone, summary = "mixed", "ภาวะไม่ชัดเจน ราคาผันผวน"
+    try:
+        import json
+        j = json.loads(txt.replace("'", '"'))
+        tone = (j.get("tone") or "mixed").lower()
+        summary = j.get("summary", "ภาวะไม่ชัดเจน ราคาผันผวน")
+    except Exception:
+        pass
+
+    # Derive correct action from tone + randomness (so it’s not always Buy)
+    tone_key = tone.lower()
+    if "bull" in tone_key:
+        actions = ["Buy", "Hold", "Sell"]
+        weights = [0.6, 0.3, 0.1]
+    elif "bear" in tone_key:
+        actions = ["Sell", "Hold", "Buy"]
+        weights = [0.6, 0.3, 0.1]
+    else:  # mixed / sideways
+        actions = ["Hold", "Buy", "Sell"]
+        weights = [0.5, 0.25, 0.25]
+
+    correct_action = random.choices(actions, weights=weights, k=1)[0]
+
     return Scenario(
-        name=name, sector=sec, tone=tone, summary=summary,
-        difficulty=diff, stars=stars(diff), correct_action=correct
+        name=company,
+        sector=sector,
+        difficulty=difficulty,
+        stars=_stars(difficulty),
+        tone=tone,
+        summary=summary,
+        correct_action=correct_action,
     )
 
-def generate_news(ai_client: OpenAI, scenario: Scenario, model_id: Optional[str] = None):
-    hint = 1 if scenario.difficulty <= 2 else 2 if scenario.difficulty == 3 else 3
-    n_items = 4
-    sys = (
-        "คุณจะสร้างข่าวสั้นเพื่อช่วยผู้เล่นตัดสินใจในสถานการณ์หุ้น "
-        "ตอบเป็น JSON: {"
-        "\"news\": [{\"headline\": str, \"blurb\": str}], "
-        "\"decision_brief\": {"
-        "\"pros\": [str], \"cons\": [str], "
-        "\"signals\": [str], \"bias\": \"bullish|bearish|mixed\" } } "
-        "หลีกเลี่ยงตัวเลขละเอียดและลิงก์"
-    )
-    user = (
-        f"บริษัท: '{scenario.name}', อุตสาหกรรม: '{scenario.sector}'. "
-        f"โทนสถานการณ์: {scenario.tone}. ระดับใบ้คำ {hint} (3=กำกวม). "
-        "หัวข้อข่าว 6-10 คำ, คำโปรย 1 ประโยค. "
-        "ใน decision_brief ให้ระบุ pros/cons ที่ชี้ไปสู่ Buy/Sell/Hold และสัญญาณสำคัญสั้นๆ"
-    )
-    resp = ai_client.chat.completions.create(
-        model=model_id or "typhoon-v1",
-        messages=[{"role":"system","content":sys},{"role":"user","content":user}],
-        temperature=0.7
-    )
-    data = _safe_parse_json(resp.choices[0].message.content)
-    items = (data.get("news") or [])[:n_items]
-    brief = data.get("decision_brief") or {}
-    brief.setdefault("pros", [])
-    brief.setdefault("cons", [])
-    brief.setdefault("signals", [])
-    brief["bias"] = brief.get("bias") if brief.get("bias") in {"bullish","bearish","mixed"} else "mixed"
-    return {"items": items, "brief": brief}
 
-def _max_pct_by_bankroll(bankroll: int) -> float:
-    b = abs(bankroll)
-    if b < 5_000: return 0.08
-    if b < 20_000: return 0.12
-    if b < 100_000: return 0.18
-    return 0.25
+def generate_news(ai: OpenAI, scenario: Scenario, *, model_id: str) -> Dict:
+    """
+    News focuses on 'company decisions' and clarity depends on difficulty:
 
-def _difficulty_vol_multiplier(difficulty: int) -> float:
-    return 1.0 + 0.15 * (difficulty - 1)   # 1.0 .. 1.6
-
-def _floor_min_by_difficulty(difficulty: int) -> int:
-    return min(500, 100 + (difficulty - 1) * 100)
-
-def compute_trade_size(request_amount: Optional[int], bankroll: int, difficulty: int) -> int:
-    floor_abs = 100
-    cap_pct = _max_pct_by_bankroll(bankroll)
-    cap_abs = int(max(200, abs(bankroll) * cap_pct))
-    if bankroll < 0:
-        cap_abs = min(cap_abs, abs(bankroll))
-    if request_amount and request_amount > 0:
-        size = max(floor_abs, min(request_amount, cap_abs))
+    - difficulty 1–2 (easy):
+        Every blurb clearly states if investors/public see it as positive or negative.
+    - difficulty 3 (medium):
+        Mix of clearly positive/negative and 'mixed/divided' reactions.
+    - difficulty 4–5 (hard):
+        Several items are just factual; reaction is ambiguous or conflicting.
+    """
+    d = scenario.difficulty
+    if d <= 2:
+        reaction_rule = (
+            "ระดับความยากต่ำ (ง่าย): ให้ทุกข่าวระบุชัดใน blurb ว่าข่าวนี้ "
+            "เป็นบวกหรือเป็นลบต่อมุมมองนักลงทุน เช่น "
+            "'โดยภาพรวมตลาดตอบรับเชิงบวก' หรือ 'นักลงทุนส่วนใหญ่กังวลและมองเชิงลบ'"
+        )
+    elif d == 3:
+        reaction_rule = (
+            "ระดับความยากกลาง: ให้บางข่าวระบุชัดว่าเป็นบวกหรือลบ, "
+            "บางข่าวให้บอกว่า 'มุมมองนักลงทุนยังแบ่งฝ่าย/ผสม' อย่างชัดเจน"
+        )
     else:
-        size = int(abs(bankroll) * 0.10)
-        size = max(floor_abs, min(size, cap_abs))
-    return size
+        reaction_rule = (
+            "ระดับความยากสูง: หลายข่าวเล่าเป็นข้อเท็จจริงเฉยๆ โดยไม่ฟันธงชัดว่าเป็นบวกหรือลบ, "
+            "บางข่าวอาจมีมุมมองขัดแย้งกัน ให้ผู้เล่นต้องตีความเอง"
+        )
 
-def simulate_outcome(choice: str, scenario: Scenario, bankroll: int, requested_amount: Optional[int] = None):
-    size = compute_trade_size(requested_amount, bankroll, scenario.difficulty)
-    base_mu = {"bullish": 0.010, "bearish": -0.010, "mixed": 0.0}[scenario.tone]
-    sigma = 0.02 * _difficulty_vol_multiplier(scenario.difficulty)
+    sys = "คุณช่วยสร้างพาดหัวข่าวสั้นเกี่ยวกับการตัดสินใจของบริษัทในตลาดหุ้น เพื่อให้ผู้เล่นฝึกอ่านข่าว"
+    user = (
+        f"บริษัท {scenario.name} ({scenario.sector}) โทนตลาดภาพรวม: {scenario.tone}.\n"
+        "สร้างข่าวภาษาไทย 6-8 ชิ้น โดยแต่ละข่าวต้องมี:\n"
+        "- headline: อธิบาย 'การตัดสินใจของบริษัท' ให้เห็นชัด "
+        "เช่น เปิดตัวผลิตภัณฑ์ใหม่, ปรับลดต้นทุน, ซื้อกิจการ, ปรับโครงสร้าง, ขยายตลาด ฯลฯ\n"
+        "- blurb: สรุปสั้น 1 ประโยคว่าเกิดอะไรขึ้น และมุมมองของตลาด/นักลงทุนเป็นอย่างไร "
+        "(ถ้าตามกติกาความยากต้องพูดถึง)\n"
+        f"- {reaction_rule}\n\n"
+        "อย่าใช้ศัพท์เทคนิคเยอะเกินไป ให้คนเริ่มต้นอ่านรู้เรื่อง\n"
+        "ตอบ JSON: {\n"
+        "  'items': [\n"
+        "    {'headline': '...', 'blurb': '...'}, ...\n"
+        "  ],\n"
+        "  'brief': {\n"
+        "    'bias': 'bullish' | 'bearish' | 'mixed',\n"
+        "    'pros': ['มุมบวกสำคัญ 1-3 ข้อ'],\n"
+        "    'cons': ['มุมเสี่ยง 1-3 ข้อ'],\n"
+        "    'signals': ['ตัวชี้วัดหรือสิ่งที่ควรจับตา 1-3 ข้อ']\n"
+        "  }\n"
+        "}"
+    )
 
+    try:
+        r = ai.chat.completions.create(
+            model=model_id,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            temperature=0.6,
+            max_tokens=420,
+        )
+        txt = r.choices[0].message.content
+        import json
+        j = json.loads(txt.replace("'", '"'))
+        items = j.get("items", [])
+        brief = j.get("brief", {})
+    except Exception:
+        items = [
+            {
+                "headline": "บริษัทประกาศกลยุทธ์ใหม่",
+                "blurb": "บริษัทเปลี่ยนทิศทางธุรกิจครั้งใหญ่ ทำให้นักลงทุนต้องจับตาปฏิกิริยาตลาดอย่างใกล้ชิด",
+            }
+        ]
+        brief = {"bias": "mixed", "pros": [], "cons": [], "signals": []}
+
+    return {"items": items[:8], "brief": brief}
+
+
+def simulate_outcome(
+    choice: str,
+    scenario: Scenario,
+    money: int,
+    *,
+    requested_amount: int,
+) -> Tuple[int, int, int, Dict]:
+    """
+    Profit/loss is based directly on the invested amount (requested_amount after clamp).
+
+    New percentage ranges (higher, but still controlled):
+
+      diff 1:  3%–10%
+      diff 2:  4%–14%
+      diff 3:  5%–18%
+      diff 4:  6%–22%
+      diff 5:  7%–25%
+
+    Trade size is still capped as a % of bankroll, so you can't explode to 500k super fast.
+    """
+    base = max(1, int(requested_amount))
+
+    vol_map = {
+        1: (0.03, 0.10),
+        2: (0.04, 0.14),
+        3: (0.05, 0.18),
+        4: (0.06, 0.22),
+        5: (0.07, 0.25),
+    }
+    low, high = vol_map[max(1, min(5, scenario.difficulty))]
+
+    # random percentage move
+    pct = random.uniform(-high, high)
+
+    # Give correct action some positive edge, but not guaranteed win
     if choice == scenario.correct_action:
-        drift = random.gauss(base_mu * 1.5, sigma)
-    elif choice == "Hold":
-        drift = random.gauss(0.0, sigma * 0.5)
-    else:
-        drift = random.gauss(-base_mu * 1.2, sigma)
+        pct += random.uniform(low * 0.3, low * 0.9)
 
-    raw_pnl = int(size * drift)
-    min_abs = _floor_min_by_difficulty(scenario.difficulty)
-    pnl = max(raw_pnl, min_abs) if raw_pnl >= 0 else min(raw_pnl, -min_abs)
-    new_bankroll = bankroll + pnl
+    pnl = int(base * pct)
+    new_money = money + pnl
 
-    feedback_seed = {
-        "Buy": "คุณตัดสินใจเข้าซื้อ",
-        "Sell": "คุณเลือกขายชอร์ต",
-        "Hold": "คุณรอดูทิศทาง",
-        "Read News": "คุณเลือกอ่านข่าว"
-    }[choice]
+    return new_money, pnl, base, {"pct": pct}
 
-    return new_bankroll, pnl, size, feedback_seed
 
-def generate_tip_and_reason(ai_client: OpenAI, scenario: Scenario, choice: str, pnl: int, size: int, trend: str, model_id: Optional[str] = None) -> str:
-    """
-    Produce a short tip and a causal reason why the chart moved (rise/fall/sideways).
-    trend: 'uptrend' | 'downtrend' | 'sideways'
-    """
-    direction = "กำไร" if pnl >= 0 else "ขาดทุน"
-    move = {"uptrend": "ราคาปรับขึ้น", "downtrend": "ราคาปรับลง", "sideways": "ราคาแกว่งตัว"}[trend]
-    sys = "คุณเป็นติวเตอร์การเทรดในเกม ให้คำแนะนำสั้น กระชับ ไม่ใช่คำแนะนำส่วนบุคคล"
+def generate_tip_and_reason(
+    ai: OpenAI,
+    scenario: Scenario,
+    action: str,
+    pnl: int,
+    size: int,
+    trend: str,
+    *,
+    model_id: str,
+) -> str:
+    sys = "คุณอธิบายเหตุผลราคาหุ้นและให้คำแนะนำเพื่อการเรียนรู้แบบสั้น ชัด ไม่สั่งให้ทำจริง"
     user = (
-        f"สถานการณ์: tone={scenario.tone}, diff={scenario.difficulty}, sector={scenario.sector}. "
-        f"ผู้เล่นเลือก: {choice}. ผลลัพธ์: {direction} {abs(pnl)} ดอลลาร์ จากขนาด {size} ดอลลาร์. "
-        f"แนวโน้มกราฟล่าสุด: {trend} ({move}). "
-        "จงตอบ 2-3 ประโยค: "
-        "1) Tip: คำแนะนำฝึกทักษะ เช่น วิธีอ่านสัญญาณ/จัดการความเสี่ยง "
-        "2) Reason: เหตุผลเชิงเรื่องราวว่าเพราะอะไรกราฟจึงขึ้น/ลง/แกว่ง สอดคล้องกับอุตสาหกรรมและโทน"
+        f"บริษัท: {scenario.name} ({scenario.sector}) | โทน: {scenario.tone} | แนวโน้มกราฟ: {trend}\n"
+        f"ผู้เล่นเลือก: {action} | ผลลัพธ์ P&L: {pnl} จากขนาด {size}\n"
+        "อธิบายสั้นว่าทำไมราคาจึงขึ้น/ลง/แกว่ง จากมุมมองข่าว/เทคนิค แล้วให้ TIP 1-2 ข้อ\n"
+        "ตอบเป็นไทย 3-5 บรรทัด"
     )
-    resp = ai_client.chat.completions.create(
-        model=model_id or "typhoon-v1",
-        messages=[{"role":"system","content":sys},{"role":"user","content":user}],
-        temperature=0.6
-    )
-    return resp.choices[0].message.content.strip()
+    try:
+        r = ai.chat.completions.create(
+            model=model_id,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            temperature=0.5,
+            max_tokens=350,
+        )
+        return r.choices[0].message.content.strip()
+    except Exception:
+        return "ราคาขยับตามกระแสข่าวและสัญญาณเทคนิค TIP: รอการยืนยันด้วยปริมาณก่อนเพิ่มน้ำหนัก"
