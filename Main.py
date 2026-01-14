@@ -599,9 +599,6 @@ async def invest(interaction: Interaction, amount: int):
         color=discord.Color.blue(),
     )
     em.add_field(name="ความยาก", value=scenario.stars, inline=True)
-    em.add_field(
-        name="โทนตลาด", value=scenario.tone.capitalize(), inline=True
-    )
     em.add_field(name="ยอดเงิน", value=f"${money:,}", inline=True)
     em.add_field(name="เพดานลงทุน", value=f"${cap:,}", inline=True)
     em.add_field(name="ลงทุนรอบนี้", value=f"${invest_amount:,}", inline=True)
@@ -688,7 +685,7 @@ async def askinvest(interaction: Interaction, question: str):
     )
     if refs:
         ref_lines = [
-            f"[{r['n']}] {r['title']} — {r['source']}" for r in refs[:10]
+            f"[{r['rank']}] {r['title']} — {r['source']}" for r in refs[:10]
         ]
         em.add_field(
             name=label, value="\n".join(ref_lines)[:1024], inline=False

@@ -60,12 +60,17 @@ def generate_scenario(
 
     sys = "คุณเป็นผู้ช่วยสร้างสถานการณ์ลงทุนให้ผู้ใช้ฝึกตัดสินใจ หลีกเลี่ยงคำแนะนำเชิงส่วนบุคคล"
     user = (
-        f"สร้างสถานการณ์จำลองหุ้นเป็นภาษาไทยแบบย่อ 3-5 บรรทัด\n"
+        f"สร้างสถานการณ์จำลองหุ้นเป็นภาษาไทยแบบละเอียด 4-6 บรรทัด\n"
         f"- ชื่อบริษัท: {company}, กลุ่ม: {sector}\n"
-        f"- ระดับความยาก (1-5): {difficulty}\n"
-        f"- ให้โทนตลาด (bullish/bearish/mixed) และเหตุผลย่อ\n"
-        f"- ไม่ต้องระบุคำตอบที่ถูกต้องในข้อความ, ให้ใช้เฉพาะ tone\n"
-        f"ตอบ JSON: {{'tone':..., 'summary':...}}"
+        f"- ระดับความยาก (1-5): {difficulty}\n\n"
+        "ข้อกำหนดสำคัญ:\n"
+        "1. สร้างเหตุการณ์เฉพาะเจาะจง เช่น: ประกาศผลประกอบการ, ซื้อกิจการ, เปิดตัวผลิตภัณฑ์, "
+        "ปรับโครงสร้าง, ฟ้องร้อง, ได้สัญญาใหม่, ปัญหาซัพพลายเชน ฯลฯ\n"
+        "2. ใส่ตัวเลขจริง เช่น: กำไรเพิ่มขึ้น 23%, ราคาหุ้นร่วง 15%, สัญญามูลค่า 500 ล้านบาท\n"
+        "3. อธิบายบริบทตลาดโดยรอบ เช่น: คู่แข่งทำอะไร, สภาพเศรษฐกิจ, นโยบายรัฐ\n"
+        "4. ห้ามบอกตรงๆ ว่าควร Buy/Sell/Hold แต่ให้ข้อมูลเพียงพอที่ผู้เล่นจะตัดสินใจได้\n"
+        "5. ใช้โทนเล่าเรื่องแบบข่าว ไม่ใช่รายงานแห้งๆ\n\n"
+        "ตอบ JSON: {'tone':'bullish'|'bearish'|'mixed', 'summary':'...(สถานการณ์ละเอียด)...'}"
     )
 
     try:
@@ -197,17 +202,20 @@ def simulate_outcome(
     requested_amount: int,
 ) -> Tuple[int, int, int, Dict]:
     """
-    Profit/loss is based directly on the invested amount (requested_amount after clamp).
+    Profit/loss is based on the invested amount AND the scenario's tone.
 
-    New percentage ranges (higher, but still controlled):
+    The scenario's tone (bullish/bearish/mixed) now directly influences
+    the underlying "market movement" direction:
+    - Bullish: Market tends to go UP. Buying is advantageous.
+    - Bearish: Market tends to go DOWN. Selling is advantageous.
+    - Mixed: Market is unpredictable. Holding is safer.
 
-      diff 1:  3%–10%
-      diff 2:  4%–14%
-      diff 3:  5%–18%
-      diff 4:  6%–22%
-      diff 5:  7%–25%
+    The player's choice then interacts with this movement:
+    - Buy in an up-market = profit. Buy in a down-market = loss.
+    - Sell in a down-market = profit. Sell in an up-market = loss.
+    - Hold = small P&L based on market direction.
 
-    Trade size is still capped as a % of bankroll, so you can't explode to 500k super fast.
+    Difficulty scales the volatility (magnitude of moves).
     """
     base = max(1, int(requested_amount))
 
@@ -220,17 +228,39 @@ def simulate_outcome(
     }
     low, high = vol_map[max(1, min(5, scenario.difficulty))]
 
-    # random percentage move
-    pct = random.uniform(-high, high)
+    # --- Determine market direction based on scenario tone ---
+    tone_key = scenario.tone.lower()
+    if "bull" in tone_key:
+        # Bullish: market moves up on average
+        market_move = random.uniform(low * 0.5, high)
+    elif "bear" in tone_key:
+        # Bearish: market moves down on average
+        market_move = random.uniform(-high, -low * 0.5)
+    else:
+        # Mixed/sideways: small, unpredictable move
+        market_move = random.uniform(-low, low)
 
-    # Give correct action some positive edge, but not guaranteed win
+    # --- Determine P&L based on player's choice vs market direction ---
+    choice_upper = choice.upper()
+    if choice_upper == "BUY":
+        # Profit if market goes up, loss if market goes down
+        pct = market_move
+    elif choice_upper == "SELL":
+        # Profit if market goes down (short position), loss if market goes up
+        pct = -market_move
+    else:  # HOLD
+        # Small fraction of the move (you're not fully exposed)
+        pct = market_move * random.uniform(0.1, 0.3)
+
+    # --- Bonus for choosing the "correct" action (educational reward) ---
     if choice == scenario.correct_action:
-        pct += random.uniform(low * 0.3, low * 0.9)
+        bonus = random.uniform(low * 0.2, low * 0.5)
+        pct += bonus if pct >= 0 else -bonus  # amplify the result
 
     pnl = int(base * pct)
     new_money = money + pnl
 
-    return new_money, pnl, base, {"pct": pct}
+    return new_money, pnl, base, {"pct": pct, "market_move": market_move}
 
 
 def generate_tip_and_reason(

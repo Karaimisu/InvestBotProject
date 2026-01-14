@@ -36,11 +36,13 @@ def _read_all() -> dict[int, dict]:
                     uid = int(row.get("user_id", "0"))
                 except ValueError:
                     continue
-                def _iv(key, default=0):
+
+                def _iv(key, default=0, _row=row):
                     try:
-                        return int(row.get(key, default))
+                        return int(_row.get(key, default))
                     except (TypeError, ValueError):
                         return default
+
                 rows[uid] = {
                     "username": row.get("username", "") or "",
                     "money": _iv("money", 0),

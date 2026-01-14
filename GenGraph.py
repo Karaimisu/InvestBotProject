@@ -41,18 +41,30 @@ def simulate_stock(start_price=100.0, days=252, mu=0.10, sigma=0.25,
     dt = 1 / 252
     mu_d = mu * dt
     sigma_d = sigma * np.sqrt(dt)
+
+    # Vectorized random components
+    shocks = np.random.randn(days) * sigma_d
+    jumps = np.where(
+        np.random.rand(days) < jump_prob,
+        np.random.normal(jump_mu, jump_sigma, days),
+        0.0
+    )
+
+    # Pre-compute base log returns (without momentum)
+    base_log_r = (mu_d - 0.5 * sigma_d**2) + shocks + jumps
+
+    # Momentum requires sequential computation, but we can still optimize
     prices = np.empty(days, dtype=np.float32)
     prices[0] = start_price
     last_ret = 0.0
     for t in range(1, days):
-        shock = np.random.randn() * sigma_d
-        jump = np.random.normal(jump_mu, jump_sigma) if np.random.rand() < jump_prob else 0.0
         momentum = 0.25 * last_ret
         if np.random.rand() < 0.05:
             momentum *= -1
-        log_r = (mu_d - 0.5 * sigma_d**2) + shock + jump + momentum
+        log_r = base_log_r[t] + momentum
         prices[t] = prices[t-1] * np.exp(log_r)
         last_ret = log_r
+
     return prices
 
 def generate_stock_graph(days=252):

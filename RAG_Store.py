@@ -112,5 +112,5 @@ def retrieve(query: str, k: int = 6) -> List[Dict]:
     for rank, idxi in enumerate(I[0]):
         if idxi < 0 or idxi >= len(docs): continue
         m = docs[idxi]
-        out.append({"rank": rank+1, "title": m["title"], "source": m["source"], "text": ""})  # keep light
+        out.append({"rank": rank+1, "title": m["title"], "source": m["source"]})
     return out
